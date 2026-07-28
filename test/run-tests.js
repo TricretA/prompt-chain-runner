@@ -1273,6 +1273,148 @@ test('dashboard API: import/save/queue endpoints and the security guards', async
   }
 });
 
+// ---------------------------------------------------------------- model selection
+const modelArg = (argv) => argv[argv.indexOf('--model') + 1];
+
+test('model config: no --model flag is added when nothing is configured', () => {
+  const c = setupCase('model-unset', {
+    phases: [{ id: 'p1', prompt: 'anything' }],
+    calls: [{ files: { 'app.txt': 'GOOD' } }],
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  const argv = claudeCalls(c)[0].argv;
+  assert.ok(!argv.includes('--model'), `--model should be absent, got: ${argv.join(' ')}`);
+  assert.ok(!argv.includes('--fallback-model'), `--fallback-model should be absent, got: ${argv.join(' ')}`);
+});
+
+test('model config: default_model applies to every role unless overridden', () => {
+  const c = setupCase('model-default', {
+    phases: [{ id: 'p1', prompt: 'build it' }],
+    calls: [
+      { files: { 'app.txt': 'GOOD' } },
+      { files: { '.pcr/verdict.json': JSON.stringify({ pass: true, summary: 'ok' }) } },
+    ],
+    config: { default_model: 'haiku', tester: { enabled: true } },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  const calls = claudeCalls(c);
+  assert.strictEqual(calls.length, 2, 'builder + tester');
+  for (const call of calls) {
+    assert.ok(call.argv.includes('--model'), `--model missing from: ${call.argv.join(' ')}`);
+    assert.strictEqual(modelArg(call.argv), 'haiku');
+  }
+});
+
+test('model config: a per-role override wins over default_model', () => {
+  const c = setupCase('model-planner', {
+    phases: [],
+    queueExtra: { brief: 'a bakery site', project_name: 'bakery' },
+    calls: [
+      { files: { '.pcr/plan.json': JSON.stringify({
+        project_name: 'bakery', stack: 'static', deploy_target: 'github-pages',
+        context: 'warm', prompts: [{ title: 'scaffold', prompt: 'create index.html saying GOOD' }],
+      }) } },
+      { files: { 'app.txt': 'GOOD' } },
+    ],
+    config: { default_model: 'haiku', planner_model: 'opus' },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  const calls = claudeCalls(c);
+  assert.strictEqual(calls.length, 2, 'planner + builder');
+  assert.strictEqual(modelArg(calls[0].argv), 'opus', 'planner uses its own override');
+  assert.strictEqual(modelArg(calls[1].argv), 'haiku', 'builder falls back to default_model');
+});
+
+test('model config: the Debugger uses debugger_model, everything else falls back to default_model', () => {
+  const c = setupCase('model-debugger', {
+    phases: [{ id: 'p1', prompt: 'first task' }, { id: 'p2', prompt: 'the hard one' }],
+    calls: [
+      { files: { 'app.txt': 'GOOD base' } },
+      { files: { 'app.txt': 'BAD 1' } },
+      { files: { 'app.txt': 'BAD 2' } },
+      { files: { 'app.txt': 'BAD 3' } },
+      { files: { '.pcr/diagnosis.json': JSON.stringify({
+        root_cause: 'the check wants the literal word GOOD', why_previous_fixes_failed: 'reworded BAD',
+        exact_change_needed: 'write GOOD', files_to_change: ['app.txt'], confidence: 'high',
+      }) } },
+      { files: { 'app.txt': 'BAD 4' } },
+      { files: { 'app.txt': 'GOOD at last' } },
+    ],
+    config: { max_retries: 4, default_model: 'haiku', debugger_model: 'sonnet' },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  const calls = claudeCalls(c);
+  const debuggerCall = calls.find((x) => /DEBUGGER agent/.test(x.prompt));
+  assert.ok(debuggerCall, 'the Debugger agent was reached');
+  assert.strictEqual(modelArg(debuggerCall.argv), 'sonnet', 'debugger uses its own override');
+  for (const call of calls) {
+    if (call === debuggerCall) continue;
+    assert.strictEqual(modelArg(call.argv), 'haiku', `expected haiku, got argv: ${call.argv.join(' ')}`);
+  }
+});
+
+test('model config: Designer, Security, and Deployer each use their own override', () => {
+  const c = setupCase('model-design-security-deploy', {
+    phases: [{ id: 'p1', prompt: 'build it' }],
+    calls: [
+      { files: { 'app.txt': 'GOOD' } },
+      { files: { 'style.css': 'body{}', '.pcr/design.json': JSON.stringify({
+        score_before: 5, score_after: 8, issues_found: [], changes_made: [], remaining_issues: [], verified_in_pixels: true,
+      }) } },
+      { files: { '.pcr/security.json': JSON.stringify({ pass: true, summary: 'clean', critical: [], warnings: [], changes_made: [] }) } },
+      { files: { '.pcr/deploy.json': JSON.stringify({ target: 'github-pages', repo_url: 'https://github.com/x/y', pages_url: 'https://x.github.io/y/', live: true }) } },
+    ],
+    config: {
+      default_model: 'haiku', design_model: 'sonnet', security_model: 'opus', deployer_model: 'sonnet',
+      design: { enabled: true, rounds: 1 },
+      security: { enabled: true, block_deploy: true, max_fix_rounds: 2 },
+      deploy: { enabled: true, verify_live: false, target: 'github-pages' },
+    },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  const calls = claudeCalls(c);
+  assert.strictEqual(calls.length, 4, 'builder, designer, security, deployer');
+  assert.strictEqual(modelArg(calls[0].argv), 'haiku', 'builder uses default_model');
+  assert.match(calls[1].prompt, /DESIGN agent/);
+  assert.strictEqual(modelArg(calls[1].argv), 'sonnet', 'designer uses its override');
+  assert.match(calls[2].prompt, /SECURITY agent/);
+  assert.strictEqual(modelArg(calls[2].argv), 'opus', 'security uses its override');
+  assert.match(calls[3].prompt, /DEPLOYER agent/);
+  assert.strictEqual(modelArg(calls[3].argv), 'sonnet', 'deployer uses its override');
+});
+
+test('model config: fallback_model adds --fallback-model to every call', () => {
+  const c = setupCase('model-fallback', {
+    phases: [{ id: 'p1', prompt: 'anything' }],
+    calls: [{ files: { 'app.txt': 'GOOD' } }],
+    config: { default_model: 'haiku', fallback_model: 'sonnet,opus' },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  const argv = claudeCalls(c)[0].argv;
+  const i = argv.indexOf('--fallback-model');
+  assert.ok(i !== -1, `--fallback-model missing from: ${argv.join(' ')}`);
+  assert.strictEqual(argv[i + 1], 'sonnet,opus');
+});
+
+test('model config: --dry-run prints the resolved model for every role', () => {
+  const c = setupCase('model-dry-run', {
+    phases: [{ id: 'p1', prompt: 'anything' }],
+    calls: [{ files: { 'app.txt': 'GOOD' } }],
+    config: { default_model: 'haiku', security_model: 'opus' },
+  });
+  const res = runRunner(c, ['--dry-run']);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  assert.match(res.stdout, /Models:/);
+  assert.match(res.stdout, /builder=haiku/);
+  assert.match(res.stdout, /security=opus/);
+});
+
 // ---------------------------------------------------------------- summary
 console.log('prompt-chain-runner test suite\n');
 rmrf(TMP);

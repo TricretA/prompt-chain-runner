@@ -40,7 +40,7 @@ const { detectChecks, describeChecks } = require('./lib/autocheck');
 const { killActiveClaude } = require('./lib/claude');
 const {
   runPlanner, runBuilder, runBuilderFix, runTester, runDebugger,
-  runDesigner, runSecurity, runDeployer, normalizePlan,
+  runDesigner, runSecurity, runDeployer, normalizePlan, modelFor,
 } = require('./lib/agents');
 const { buildFixPrompt, buildDeployFixPrompt, buildSecurityFixPrompt, evidenceSections } = require('./lib/fix-prompt');
 const { waitUntilLive } = require('./lib/live-check');
@@ -199,6 +199,8 @@ function main() {
     console.log(`Deploy:       ${queue.deploy?.enabled === false ? 'off' : pickDeployTarget(capabilities, queue.deploy?.target || config.deploy?.target)}`);
     console.log(`On stuck:     ${onStuck === 'continue' ? 'keep going (hands-free)' : 'halt'} · max attempts per prompt: ${maxAttempts}`);
     console.log(`Budget:       ${budgetCfg.max_usd_per_run ? `$${budgetCfg.max_usd_per_run} per run` : 'no cap'}`);
+    console.log(`Models:       ${['planner', 'builder', 'tester', 'debugger', 'design', 'security', 'deployer']
+      .map((role) => `${role}=${modelFor(config, role) || '(CLI default)'}`).join(' · ')}`);
     console.log(`Backlog:      ${loadBacklog(opts.backlog).filter((i) => i.status === 'pending').length} project(s) queued after this one\n`);
     console.log('Capabilities:');
     console.log(capsText);
@@ -484,14 +486,14 @@ function main() {
       logger.section(`PLANNING: ${projectName}`);
       setActivity('planner', `planning "${projectName}" from the brief`, { stage: 'planning' });
       say('orchestrator', 'planner', null, 'inject', `New project: ${truncate(queue.brief, 300)}`);
-      logger.event('claude_start', { phase: 'plan', agent: 'planner' });
+      logger.event('claude_start', { phase: 'plan', agent: 'planner', model: modelFor(config, 'planner') });
 
       const plan = await runPlanner({ projectPath, config, onSpawn, brief: queue.brief, projectName, capabilities: capsText });
       trackCall(plan);
       const normalized = normalizePlan(plan.answer);
       logger.event('claude_done', {
         phase: 'plan', agent: 'planner', ok: plan.ok, duration_ms: plan.durationMs,
-        cost_usd: plan.parsed?.total_cost_usd ?? null, plan: normalized,
+        cost_usd: plan.parsed?.total_cost_usd ?? null, plan: normalized, model: plan.model,
       });
 
       if (!normalized) {
@@ -673,14 +675,14 @@ function main() {
       if (strategy === 'diagnosis' && !diagnosis) {
         setActivity('debugger', `${phase.id}: debugger hunting the root cause`);
         say('orchestrator', 'debugger', phase.id, 'inject', `${attempt - 1} fixes failed. Find the real cause — change nothing.`);
-        logger.event('claude_start', { phase: phase.id, agent: 'debugger', attempt });
+        logger.event('claude_start', { phase: phase.id, agent: 'debugger', attempt, model: modelFor(config, 'debugger') });
         const dbg = await runDebugger({
           projectPath, config, onSpawn, phase: phase.id, context, prompt: phase.prompt,
           history: history.join('\n\n') || lastEvidence, capabilities: capsText,
         });
         trackCall(dbg);
         diagnosis = dbg.diagnosis;
-        logger.event('diagnosis', { phase: phase.id, attempt, diagnosis: diagnosis || null, ok: dbg.ok, duration_ms: dbg.durationMs, cost_usd: dbg.parsed?.total_cost_usd ?? null });
+        logger.event('diagnosis', { phase: phase.id, attempt, diagnosis: diagnosis || null, ok: dbg.ok, duration_ms: dbg.durationMs, cost_usd: dbg.parsed?.total_cost_usd ?? null, model: dbg.model });
         say('debugger', 'orchestrator', phase.id, diagnosis ? 'report' : 'error',
           diagnosis ? `Root cause: ${truncate(String(diagnosis.root_cause || ''), 400)}` : 'I could not produce a diagnosis.');
       }
@@ -704,7 +706,7 @@ function main() {
       setActivity('builder', `${phase.id}: builder working (attempt ${attempt}${strategy === 'initial' ? '' : `, ${strategy}`})`, { attempt });
       say('orchestrator', 'builder', phase.id, strategy === 'initial' ? 'inject' : 'fix',
         strategy === 'initial' ? `New task: ${phase.title || phase.id}` : `Attempt ${attempt} — ${strategy.replace('_', ' ')}.`);
-      logger.event('claude_start', { phase: phase.id, agent: 'builder', attempt, kind: strategy });
+      logger.event('claude_start', { phase: phase.id, agent: 'builder', attempt, kind: strategy, model: modelFor(config, 'builder') });
 
       // With no failure evidence yet (the session itself kept dying), a "fix"
       // prompt would carry nothing to fix — resend the real task instead.
@@ -725,7 +727,7 @@ function main() {
       if (!build.ok) {
         logger.log(`Builder call FAILED: ${build.error}`);
         if (build.stderr) logger.block('builder stderr:', truncate(build.stderr, 4000));
-        logger.event('claude_error', { phase: phase.id, agent: 'builder', attempt, error: build.error, duration_ms: build.durationMs });
+        logger.event('claude_error', { phase: phase.id, agent: 'builder', attempt, error: build.error, duration_ms: build.durationMs, model: build.model });
         say('builder', 'orchestrator', phase.id, 'error', `My session failed: ${truncate(build.error, 300)}`);
         history.push(`attempt ${attempt} (${strategy}): the builder session itself failed — ${truncate(build.error, 300)}`);
         const done = await consumeAttempt(phase, `the builder session kept failing (${truncate(build.error, 150)})`);
@@ -741,6 +743,7 @@ function main() {
         phase: phase.id, agent: 'builder', attempt, ok: true,
         duration_ms: build.durationMs, cost_usd: build.parsed?.total_cost_usd ?? null,
         num_turns: build.parsed?.num_turns ?? null, result: truncate(resultText, 2000), report: build.report || null,
+        model: build.model,
       });
       say('builder', 'orchestrator', phase.id, 'report', `Done. ${truncate(reportSummary, 400)}`);
 
@@ -770,7 +773,7 @@ function main() {
           setActivity('tester', `${phase.id}: tester verifying the work`);
           say('orchestrator', 'tester', phase.id, 'test_request',
             `Builder says: "${truncate(reportSummary, 200)}". Verify it${regression.length ? `, plus ${regression.length} earlier criteria` : ''}.`);
-          logger.event('claude_start', { phase: phase.id, agent: 'tester', attempt });
+          logger.event('claude_start', { phase: phase.id, agent: 'tester', attempt, model: modelFor(config, 'tester') });
           const test = await runTester({
             projectPath, config, onSpawn, phase: phase.id, context, prompt: phase.prompt,
             report: build.report, builderResult: resultText,
@@ -800,7 +803,7 @@ function main() {
           logger.event('verdict', {
             phase: phase.id, attempt, pass: lastVerdict.pass, summary: lastVerdict.summary,
             failures: lastVerdict.failures, criteria: lastVerdict.criteria, source: lastVerdict.source,
-            duration_ms: test.durationMs, cost_usd: test.parsed?.total_cost_usd ?? null,
+            duration_ms: test.durationMs, cost_usd: test.parsed?.total_cost_usd ?? null, model: test.model,
           });
           say('tester', 'orchestrator', phase.id, 'verdict',
             lastVerdict.pass ? `PASS — ${truncate(lastVerdict.summary, 300)}` : `FAIL — ${truncate(lastVerdict.summary, 300)}`);
@@ -880,14 +883,14 @@ function main() {
       logger.section(`DESIGN REVIEW round ${round}/${designCfg.rounds}`);
       setActivity('designer', `design review round ${round} — looking at real screenshots`, { stage: 'design', current_phase: 'design' });
       say('orchestrator', 'designer', 'design', 'inject', `Look at the built site and fix what looks bad (round ${round}).`);
-      logger.event('claude_start', { phase: 'design', agent: 'designer', attempt: round });
+      logger.event('claude_start', { phase: 'design', agent: 'designer', attempt: round, model: modelFor(config, 'design') });
 
       const des = await runDesigner({ projectPath, config, onSpawn, context, capabilities: capsText, round, rounds: designCfg.rounds || 1, previousIssues });
       trackCall(des);
       const d = des.design;
       logger.event('design_result', {
         round, ok: des.ok, design: d || null,
-        duration_ms: des.durationMs, cost_usd: des.parsed?.total_cost_usd ?? null,
+        duration_ms: des.durationMs, cost_usd: des.parsed?.total_cost_usd ?? null, model: des.model,
       });
 
       if (!d) {
@@ -930,14 +933,14 @@ function main() {
       logger.section(`SECURITY GATE (round ${round})`);
       setActivity('security', 'security gate — checking before anything goes public', { stage: 'security', current_phase: 'security' });
       say('orchestrator', 'security', 'security', 'inject', 'Last check before this goes public.');
-      logger.event('claude_start', { phase: 'security', agent: 'security', attempt: round });
+      logger.event('claude_start', { phase: 'security', agent: 'security', attempt: round, model: modelFor(config, 'security') });
 
       const sec = await runSecurity({ projectPath, config, onSpawn, context, capabilities: capsText, target });
       trackCall(sec);
       const s = sec.security;
       logger.event('security_result', {
         round, ok: sec.ok, security: s || null,
-        duration_ms: sec.durationMs, cost_usd: sec.parsed?.total_cost_usd ?? null,
+        duration_ms: sec.durationMs, cost_usd: sec.parsed?.total_cost_usd ?? null, model: sec.model,
       });
 
       if (!s) {
@@ -983,7 +986,7 @@ function main() {
       say('orchestrator', 'builder', 'security', 'fix', `Security blocked release: ${truncate(critical.map((c) => c.what).join('; ') || s.summary || '', 300)}`);
       const fix = await runBuilderFix({ projectPath, config, onSpawn, fixPrompt: buildSecurityFixPrompt({ security: { ...s, critical }, context }) });
       trackCall(fix);
-      logger.event('claude_done', { phase: 'security', agent: 'builder', attempt: round, ok: fix.ok, duration_ms: fix.durationMs, cost_usd: fix.parsed?.total_cost_usd ?? null, report: fix.report || null });
+      logger.event('claude_done', { phase: 'security', agent: 'builder', attempt: round, ok: fix.ok, duration_ms: fix.durationMs, cost_usd: fix.parsed?.total_cost_usd ?? null, report: fix.report || null, model: fix.model });
       const verification = await verifyPhase(projectPath, config, logger, 'security', stopRequested);
       if (verification.aborted) stopNow();
       if (verification.allPassed) commitPhase(projectPath, 'security', 'auto: security fixes');
@@ -1017,7 +1020,7 @@ function main() {
       setActivity('deployer', `deploy: attempt ${attempt} — publishing to ${target}`);
       say('orchestrator', 'deployer', 'deploy', fixPrompt ? 'fix' : 'inject',
         fixPrompt ? `Still not live — fix it (attempt ${attempt}).` : `Project verified. Ship "${repoName}" to ${target}.`);
-      logger.event('claude_start', { phase: 'deploy', agent: 'deployer', attempt });
+      logger.event('claude_start', { phase: 'deploy', agent: 'deployer', attempt, model: modelFor(config, 'deployer') });
 
       const dep = await runDeployer({
         projectPath, config, onSpawn, projectName, repoName,
@@ -1029,7 +1032,7 @@ function main() {
       logger.event('claude_done', {
         phase: 'deploy', agent: 'deployer', attempt, ok: dep.ok,
         duration_ms: dep.durationMs, cost_usd: dep.parsed?.total_cost_usd ?? null,
-        result: truncate(String(dep.parsed?.result ?? ''), 2000), deploy: info || null,
+        result: truncate(String(dep.parsed?.result ?? ''), 2000), deploy: info || null, model: dep.model,
       });
       say('deployer', 'orchestrator', 'deploy', 'report',
         info ? `${info.target || target}: ${info.pages_url || '?'} (live: ${info.live})` : 'I did not write a deploy report.');

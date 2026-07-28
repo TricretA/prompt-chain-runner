@@ -1,6 +1,7 @@
 {
   "claude_command": "claude",
   "claude_args": [],
+  "default_model": "haiku",
   "claude_timeout_ms": 3600000,
   "planner_timeout_ms": 900000,
   "tester_timeout_ms": 1200000,

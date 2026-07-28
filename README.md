@@ -112,6 +112,9 @@ Verification is automatic; there is nothing you *must* edit.
 | Key | Meaning |
 |---|---|
 | `claude_command`, `claude_args` | The CLI to drive (array form supported; tests use it to swap in a mock). |
+| `default_model` | Model every agent uses unless overridden below. **Default: `"haiku"`** — cheapest/fastest tier, since Builder and Tester are called once per phase attempt and dominate cost. |
+| `planner_model`, `builder_model`, `tester_model`, `debugger_model`, `design_model`, `security_model`, `deployer_model` | Per-role override, e.g. `"sonnet"` or a full ID like `"claude-sonnet-5"`. Unset → falls back to `default_model` → unset entirely means the CLI's own default. Debugger/Designer/Security are low-volume judgment calls (root-cause analysis, visual review, vulnerability audit) where a stronger model can pay for itself by avoiding extra retries or missing a real finding — dial those up individually if quality suffers on `haiku`. |
+| `fallback_model` | Comma-separated list passed as `--fallback-model`, tried in order for one turn if the primary is overloaded, e.g. `"sonnet,opus"`. Unset by default (no automatic cost escalation). |
 | `claude_timeout_ms`, `planner_/tester_/debugger_/design_/security_timeout_ms` | Hard kill per agent call. |
 | `max_retries` | Rungs on the escalation ladder per prompt (and deploy attempts). Default 5. |
 | `on_stuck` | `"continue"` (default, hands-free — mark degraded and keep going) or `"halt"`. |
