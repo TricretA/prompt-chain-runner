@@ -112,8 +112,8 @@ Verification is automatic; there is nothing you *must* edit.
 | Key | Meaning |
 |---|---|
 | `claude_command`, `claude_args` | The CLI to drive (array form supported; tests use it to swap in a mock). |
-| `default_model` | Model every agent uses unless overridden below. **Default: `"haiku"`** — cheapest/fastest tier, since Builder and Tester are called once per phase attempt and dominate cost. |
-| `planner_model`, `builder_model`, `tester_model`, `debugger_model`, `design_model`, `security_model`, `deployer_model` | Per-role override, e.g. `"sonnet"` or a full ID like `"claude-sonnet-5"`. Unset → falls back to `default_model` → unset entirely means the CLI's own default. Debugger/Designer/Security are low-volume judgment calls (root-cause analysis, visual review, vulnerability audit) where a stronger model can pay for itself by avoiding extra retries or missing a real finding — dial those up individually if quality suffers on `haiku`. |
+| `default_model` | Model every agent uses unless overridden below. **Default: `"haiku"`** — cheapest/fastest tier, since Builder and Tester are called once per phase attempt and dominate cost. Editable from the dashboard's **Prompts → Models** card, not just this file. |
+| `planner_model`, `builder_model`, `tester_model`, `debugger_model`, `design_model`, `security_model`, `deployer_model` | Per-role override, e.g. `"sonnet"` or a full ID like `"claude-sonnet-5"`. Unset → falls back to `default_model` → unset entirely means the CLI's own default. Debugger/Designer/Security are low-volume judgment calls (root-cause analysis, visual review, vulnerability audit) where a stronger model can pay for itself by avoiding extra retries or missing a real finding — dial those up individually if quality suffers on `haiku`. Also settable from the dashboard's Models card; takes effect on the next run. |
 | `fallback_model` | Comma-separated list passed as `--fallback-model`, tried in order for one turn if the primary is overloaded, e.g. `"sonnet,opus"`. Unset by default (no automatic cost escalation). |
 | `claude_timeout_ms`, `planner_/tester_/debugger_/design_/security_timeout_ms` | Hard kill per agent call. |
 | `max_retries` | Rungs on the escalation ladder per prompt (and deploy attempts). Default 5. |
@@ -143,7 +143,7 @@ The zero-setup option is [ntfy](https://ntfy.sh): install the app, pick any hard
 ## The three tabs
 
 - **Live** — status pill + Start/Stop/Kill; stat tiles (project, progress, elapsed, cost); the four agent cards with live activity; the prompt pipeline with per-prompt status and retry counts (plus the 🚀 deploy chip); the agent feed; a big green banner with the live URL when done.
-- **Prompts** — file drop / paste → parsed preview (editable, reorderable) → project name, deploy toggle, repo name → Save / Save & start.
+- **Prompts** — a **Models** card at the top (a dropdown per agent role — Default, Planner, Builder, Tester, Debugger, Designer, Security, Deployer — choosing Haiku/Sonnet/Opus/Fable) so you don't have to hand-edit `config.json` to control cost; then file drop / paste → parsed preview (editable, reorderable) → project name, deploy toggle, repo name → Save / Save & start.
 - **Logs** — run selector, per-prompt filter chips, expandable full detail for every event, raw log download.
 
 The dashboard binds to `127.0.0.1` only and rejects foreign `Host`/`Origin` headers (DNS-rebinding/CSRF protection). It is a local control panel — never expose it.

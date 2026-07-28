@@ -15,11 +15,24 @@
   "fix_prompt_output_limit": 8000,
   "verify_timeout_ms": 600000,
   "dashboard_port": 4747,
-  "tester": { "enabled": true },
-  "design": { "enabled": true, "rounds": 1 },
-  "security": { "enabled": true, "block_deploy": true, "max_fix_rounds": 2 },
-  "lessons": { "enabled": true },
-  "budget": { "max_usd_per_run": 40 },
+  "tester": {
+    "enabled": true
+  },
+  "design": {
+    "enabled": true,
+    "rounds": 1
+  },
+  "security": {
+    "enabled": true,
+    "block_deploy": true,
+    "max_fix_rounds": 2
+  },
+  "lessons": {
+    "enabled": true
+  },
+  "budget": {
+    "max_usd_per_run": 40
+  },
   "deploy": {
     "enabled": true,
     "target": "auto",
@@ -29,11 +42,25 @@
   },
   "notify": {
     "enabled": true,
-    "ntfy": { "topic": "" },
-    "telegram": { "bot_token": "", "chat_id": "" },
-    "discord": { "webhook_url": "" },
-    "slack": { "webhook_url": "" },
-    "webhook": { "url": "" }
+    "ntfy": {
+      "topic": ""
+    },
+    "telegram": {
+      "bot_token": "",
+      "chat_id": ""
+    },
+    "discord": {
+      "webhook_url": ""
+    },
+    "slack": {
+      "webhook_url": ""
+    },
+    "webhook": {
+      "url": ""
+    }
   },
-  "watchdog": { "enabled": true, "heartbeat_stale_ms": 2700000 }
+  "watchdog": {
+    "enabled": true,
+    "heartbeat_stale_ms": 2700000
+  }
 }

@@ -158,6 +158,9 @@
   .drop.over { border-color: var(--accent); color: var(--ink-2); }
   .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
   @media (max-width: 800px) { .row2 { grid-template-columns: 1fr; } }
+  .modelGrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+  .modelGrid select { width: 100%; }
+  .modelGrid .roleHint { color: var(--muted); font-size: 11px; margin-top: 3px; }
   .prompt-item { border: 1px solid var(--hairline); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; background: var(--surface-2); }
   .prompt-item .head { display: flex; align-items: center; gap: 8px; }
   .prompt-item .num { color: var(--muted); font-weight: 700; flex: none; width: 26px; }
@@ -252,6 +255,16 @@
 
   <!-- ================= PROMPTS ================= -->
   <section class="tab" id="tab-prompts">
+    <div class="card">
+      <h2>Models · which Claude model each agent uses</h2>
+      <div class="modelGrid" id="modelGrid"></div>
+      <div class="savebar">
+        <button class="btn primary" id="btnSaveModels">Save models</button>
+        <span class="note" id="modelNote"></span>
+      </div>
+      <div class="hint">Builder and Tester run once per phase attempt and drive most of the cost — Haiku there saves the most. Debugger, Designer, and Security are rare, judgment-heavy calls (root-cause analysis, visual review, catching a real leaked secret) — a stronger model there can pay for itself by avoiding extra retries or missing a real finding. Takes effect on the next run, not the current one.</div>
+    </div>
+
     <div class="card">
       <h2>Fastest way · describe it in one line</h2>
       <div class="row2">
@@ -440,10 +453,63 @@ async function poll() {
     currentRunEvents = await tailEvents(feedFile);
   }
   render();
+  renderModels();
   renderLogsTab(false);
 }
 setInterval(poll, 1500);
 poll();
+
+/* ================= MODELS ================= */
+const MODEL_ROLES = [
+  { key: 'default_model', label: 'Default', hint: 'used by every role below unless overridden' },
+  { key: 'planner_model', label: 'Planner', hint: 'plans the whole build from a one-line brief' },
+  { key: 'builder_model', label: 'Builder', hint: 'writes the code — runs every phase attempt' },
+  { key: 'tester_model', label: 'Tester', hint: "verifies the builder's claims — runs every phase attempt" },
+  { key: 'debugger_model', label: 'Debugger', hint: 'root-cause analysis when ordinary fixes stall' },
+  { key: 'design_model', label: 'Designer', hint: 'reviews real screenshots for what looks bad' },
+  { key: 'security_model', label: 'Security', hint: 'audits for leaked secrets before publish' },
+  { key: 'deployer_model', label: 'Deployer', hint: 'ships to GitHub Pages / Vercel / Netlify' },
+];
+const MODEL_OPTIONS = [
+  { value: '', label: '— use default —', labelForDefault: '— CLI default (no --model flag) —' },
+  { value: 'haiku', label: 'Haiku — cheapest, fastest' },
+  { value: 'sonnet', label: 'Sonnet — balanced' },
+  { value: 'opus', label: 'Opus — most capable' },
+  { value: 'fable', label: 'Fable — most capable' },
+];
+
+// Built once, from the first config seen — polling every 1.5s must never blow
+// away a selection the user is mid-edit on. Reload the page to re-sync from disk.
+let modelsRendered = false;
+function renderModels() {
+  if (modelsRendered || !overview) return;
+  const cfg = overview.config || {};
+  const grid = $('modelGrid');
+  grid.replaceChildren();
+  for (const role of MODEL_ROLES) {
+    const sel = h('select', { id: 'model-' + role.key },
+      ...MODEL_OPTIONS.map((o) => h('option', {
+        value: o.value,
+        text: (role.key === 'default_model' && o.labelForDefault) ? o.labelForDefault : o.label,
+      })));
+    sel.value = cfg[role.key] || '';
+    grid.append(h('div', {},
+      h('label', { class: 'lbl', text: role.label }),
+      sel,
+      h('div', { class: 'roleHint', text: role.hint })));
+  }
+  modelsRendered = true;
+}
+
+$('btnSaveModels').addEventListener('click', async () => {
+  const body = {};
+  for (const role of MODEL_ROLES) body[role.key] = $('model-' + role.key).value;
+  const note = $('modelNote');
+  const r = await api('/api/config/models', body);
+  if (r.data?.ok) { note.textContent = 'Saved — applies to the next run.'; note.className = 'note ok'; }
+  else { note.textContent = r.data?.error || 'Could not save.'; note.className = 'note'; }
+  setTimeout(() => { note.textContent = ''; }, 4000);
+});
 
 /* ---------------- header + live tab rendering */
 function render() {

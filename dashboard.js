@@ -41,6 +41,10 @@ const CONFIG_FILE = path.join(DATA_ROOT, 'config.json');
 const STOP_FILE = path.join(DATA_ROOT, '.stop');
 const INDEX_FILE = path.join(ROOT, 'public', 'index.html');
 const MAX_TAIL_CHUNK = 512 * 1024;
+const MODEL_CONFIG_KEYS = [
+  'default_model', 'planner_model', 'builder_model', 'tester_model',
+  'debugger_model', 'design_model', 'security_model', 'deployer_model', 'fallback_model',
+];
 
 function safeReadJson(file) {
   try { return readJson(file); } catch { return null; }
@@ -481,6 +485,22 @@ const routes = {
 
   'GET /api/queue': (req, res) => {
     json(res, 200, { queue: safeReadJson(QUEUE_FILE) });
+  },
+
+  // Per-role model selection. config.json is read fresh at the start of every
+  // run (never mid-run), so this is safe to change at any time, including
+  // while a run is in progress — it simply takes effect on the next one.
+  'POST /api/config/models': async (req, res) => {
+    const body = await readBody(req);
+    const cfg = safeReadJson(CONFIG_FILE) || {};
+    for (const key of MODEL_CONFIG_KEYS) {
+      if (!(key in body)) continue;
+      const value = String(body[key] ?? '').trim().slice(0, 200);
+      if (value) cfg[key] = value; else delete cfg[key];
+    }
+    fs.mkdirSync(path.dirname(CONFIG_FILE), { recursive: true });
+    atomicWriteJson(CONFIG_FILE, cfg);
+    json(res, 200, { ok: true, config: cfg });
   },
 
   // Whole log file as plain text (for "open raw log" in the Logs tab).

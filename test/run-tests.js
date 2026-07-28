@@ -1268,6 +1268,24 @@ test('dashboard API: import/save/queue endpoints and the security guards', async
     assert.strictEqual(badHost.status, 403, 'foreign Host must be rejected');
     const badOrigin = await req('POST', '/api/run/stop', {}, { Origin: 'https://evil.example' });
     assert.strictEqual(badOrigin.status, 403, 'foreign Origin must be rejected on POST');
+
+    // model selection: save persists, unknown keys ignored, blank clears a key
+    const save1 = await req('POST', '/api/config/models', { default_model: 'haiku', builder_model: 'sonnet', not_a_real_key: 'x' });
+    assert.strictEqual(save1.status, 200, save1.body);
+    let cfgOnDisk = readJson(path.join(dir, 'config.json'));
+    assert.strictEqual(cfgOnDisk.default_model, 'haiku');
+    assert.strictEqual(cfgOnDisk.builder_model, 'sonnet');
+    assert.strictEqual(cfgOnDisk.not_a_real_key, undefined, 'unlisted keys are not written from this endpoint');
+    assert.strictEqual(cfgOnDisk.dashboard_port, 0, 'existing keys survive a partial update');
+
+    const ov = await req('GET', '/api/overview');
+    assert.strictEqual(JSON.parse(ov.body).config.builder_model, 'sonnet', 'overview reflects the saved model config');
+
+    const save2 = await req('POST', '/api/config/models', { builder_model: '' });
+    assert.strictEqual(save2.status, 200, save2.body);
+    cfgOnDisk = readJson(path.join(dir, 'config.json'));
+    assert.strictEqual(cfgOnDisk.builder_model, undefined, 'a blank value clears the override');
+    assert.strictEqual(cfgOnDisk.default_model, 'haiku', 'unrelated keys untouched by a partial update');
   } finally {
     child.kill('SIGKILL');
   }
