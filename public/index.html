@@ -330,10 +330,12 @@ let overview = null;
 let selectedRun = '';           // '' = follow the live/latest run
 let feedFile = null;            // events file currently being tailed
 let feedOffset = 0;
+let feedRemainder = '';         // partial JSONL line held until its tail arrives
 let events = [];
 let rawFile = null;
 let rawOffset = 0;
 let currentTab = 'feed';
+let pollInFlight = false;
 
 const STATUS_LABEL = {
   pending: '○ pending',
@@ -463,8 +465,8 @@ const EV_RENDER = {
   run_start: (e) => ['info', '▶', `run started — ${e.phases?.length ?? '?'} phases, max ${e.max_retries} retries each`],
   phase_start: (e) => ['info', '■', `<b>${esc(e.phase)}</b> started (${e.index + 1}/${e.total})`],
   attempt_start: (e) => ['info', '↻', `<b>${esc(e.phase)}</b> attempt ${e.attempt}/${e.max_attempts} (${esc(e.kind)} prompt)`],
-  claude_start: (e) => ['info', '✦', `sending prompt to Claude Code (${(e.prompt_chars / 1000).toFixed(1)}k chars)`],
-  claude_done: (e) => ['good', '✦', `Claude Code finished in ${fmtDur(e.duration_ms)}${e.cost_usd != null ? ` — $${e.cost_usd.toFixed ? e.cost_usd.toFixed(4) : e.cost_usd}` : ''}${e.result ? ` <details><summary>result</summary><pre>${esc(e.result)}</pre></details>` : ''}`],
+  claude_start: (e) => ['info', '✦', `sending prompt to Claude Code (${e.prompt_chars >= 1000 ? (e.prompt_chars / 1000).toFixed(1) + 'k' : e.prompt_chars} chars)`],
+  claude_done: (e) => ['good', '✦', `Claude Code finished in ${fmtDur(e.duration_ms)}${Number.isFinite(+e.cost_usd) && e.cost_usd !== null ? ` — $${(+e.cost_usd).toFixed(4)}` : ''}${e.result ? ` <details><summary>result</summary><pre>${esc(e.result)}</pre></details>` : ''}`],
   claude_error: (e) => ['bad', '✕', `Claude Code call failed <details><summary>error</summary><pre>${esc(e.error)}</pre></details>`],
   verify_start: (e) => ['info', '⚖', `verifying <b>${esc(e.phase)}</b>: ${e.steps?.map(esc).join(' → ') || 'no steps configured'}`],
   verify_step_start: (e) => ['info', '⋯', `running check <b>${esc(e.step)}</b> — <span style="font-family:var(--mono)">${esc(e.command)}</span>`],
@@ -505,6 +507,7 @@ function renderNewEvents(newOnes) {
 function resetFeed() {
   events = [];
   feedOffset = 0;
+  feedRemainder = '';
   $('feed').innerHTML = '<div class="empty">Loading events…</div>';
   rawOffset = 0;
   $('rawlog').textContent = '';
@@ -553,12 +556,19 @@ async function pollTails() {
         if (r.offset === feedOffset && !r.data) break;
         feedOffset = r.offset;
         if (r.data) {
-          const fresh = r.data.split('\n').filter(Boolean).map((line) => {
+          // A poll can catch the runner mid-append; hold the trailing partial
+          // line until the rest of it arrives instead of dropping the event.
+          const text = feedRemainder + r.data;
+          const lines = text.split('\n');
+          feedRemainder = lines.pop() ?? '';
+          const fresh = lines.filter(Boolean).map((line) => {
             try { return JSON.parse(line); } catch { return null; }
           }).filter(Boolean);
-          events.push(...fresh);
-          renderNewEvents(fresh);
-          renderPhases();
+          if (fresh.length) {
+            events.push(...fresh);
+            renderNewEvents(fresh);
+            renderPhases();
+          }
         }
         if (r.offset >= r.size) break;
       }
@@ -586,6 +596,8 @@ async function pollTails() {
 }
 
 async function poll() {
+  if (pollInFlight) return; // overlapping polls would race the shared offsets
+  pollInFlight = true;
   try {
     overview = await api('/api/overview');
     document.body.classList.remove('offline');
@@ -599,11 +611,14 @@ async function poll() {
     await pollTails();
   } catch {
     document.body.classList.add('offline');
+  } finally {
+    pollInFlight = false;
   }
 }
 
 // ---------- controls ----------
 $('btn-start').onclick = async () => {
+  $('btn-start').disabled = true; // instantly — a double-click must not double-start
   try {
     const r = await api('/api/run/start', {
       method: 'POST',
@@ -638,7 +653,7 @@ function switchTab(tab) {
   $('tab-raw').classList.toggle('active', tab === 'raw');
   $('feed').style.display = tab === 'feed' ? '' : 'none';
   $('rawlog').style.display = tab === 'raw' ? '' : 'none';
-  if (tab === 'raw') pollTails();
+  if (tab === 'raw') poll(); // guarded — never a second concurrent tail loop
 }
 
 poll();

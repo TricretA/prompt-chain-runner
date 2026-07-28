@@ -28,7 +28,7 @@ process.stdin.on('end', () => {
 
   fs.appendFileSync(
     path.join(cwd, 'mock-prompts.jsonl'),
-    JSON.stringify({ call: state.call, prompt }) + '\n'
+    JSON.stringify({ call: state.call, prompt, argv: process.argv.slice(2) }) + '\n'
   );
   state.call += 1;
   fs.writeFileSync(stateFile, JSON.stringify(state));

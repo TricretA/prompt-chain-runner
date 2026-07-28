@@ -173,7 +173,9 @@ The run halts (exit code 2) instead of silently skipping ahead. To diagnose:
 2. Fix the cause: sharpen the phase prompt, fix the environment, or hand-fix the code in `target-project` and commit.
 3. Resume with `node runner.js --retry-stuck` (or tick *retry stuck* in the dashboard). Passed phases are never re-run.
 
-Exit codes: `0` all phases passed · `1` runner error · `2` stuck · `3` stopped.
+Exit codes: `0` all phases passed · `1` runner error (including refusing to start because another runner already holds `.runner.lock`) · `2` stuck · `3` stopped.
+
+Only one runner can be active per queue: the runner takes an exclusive `.runner.lock` (next to `state.json`) at startup and releases it on every exit path. A lock left behind by a crashed process is detected (dead pid) and stolen automatically.
 
 ## Tests
 
@@ -187,7 +189,8 @@ The suite swaps the Claude CLI for a scripted mock (`test/mock-claude.js`) but k
 
 - The runner passes `--dangerously-skip-permissions` to Claude Code. That is the flag that makes a fully unattended run possible — and it means Claude Code edits files and runs commands in `target-project` **without asking**. Point `project_path` only at a directory you're happy to have rewritten wholesale, and treat the verification gate + git history as your safety net.
 - Auto-commits in the target repo are made with signing disabled (`commit.gpgsign false`, repo-local) so an unattended run can never hang on a GPG prompt.
-- The dashboard has no authentication; it listens on localhost only. Anyone with local access to the machine can control the runner through it.
+- The dashboard has no authentication; it listens on localhost only, and rejects requests whose `Host`/`Origin` headers are not local (DNS-rebinding/CSRF protection). Anyone with local access to the machine can still control the runner through it.
+- Stop is graceful (the runner halts after the current Claude call or verification step); Kill force-kills the runner's process tree including the in-flight Claude Code call — on Windows via `taskkill /T`, on macOS/Linux via process-group kills.
 
 ## License
 

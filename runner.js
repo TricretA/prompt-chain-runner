@@ -13,8 +13,9 @@
 //                  [--logs logs] [--state state.json]
 //                  [--retry-stuck] [--dry-run]
 //
-// Exit codes: 0 all phases passed · 1 runner error · 2 a phase is stuck ·
-//             3 stopped via stop flag or signal
+// Exit codes: 0 all phases passed · 1 runner error (incl. another runner
+//             already active) · 2 a phase is stuck · 3 stopped via stop flag
+//             or signal
 
 const fs = require('fs');
 const path = require('path');
@@ -24,7 +25,7 @@ const { writeState } = require('./lib/state');
 const { loadQueue, saveQueue } = require('./lib/queue');
 const { ensureGitRepo, commitPhase } = require('./lib/git');
 const { verifyPhase } = require('./lib/verify');
-const { runClaudeCode } = require('./lib/claude');
+const { runClaudeCode, killActiveClaude } = require('./lib/claude');
 const { buildFixPrompt } = require('./lib/fix-prompt');
 
 const ROOT = __dirname;
@@ -64,7 +65,33 @@ function printHelp() {
   --dry-run         validate config + queue and print the plan, execute nothing`);
 }
 
+function pidAlive(pid) {
+  if (!pid) return false;
+  try { process.kill(pid, 0); return true; } catch { return false; }
+}
+
+// Exactly one runner per state file. Two concurrent runners would drive two
+// unattended Claude Code sessions in the same working tree, cross-commit each
+// other's half-finished edits, and clobber queue.json last-writer-wins.
+// O_EXCL create makes the guard atomic; a lock held by a dead pid is stolen.
+function acquireLock(lockFile) {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    try {
+      fs.writeFileSync(lockFile, String(process.pid), { flag: 'wx' });
+      return null;
+    } catch (err) {
+      if (err.code !== 'EEXIST') throw err;
+      let otherPid = null;
+      try { otherPid = parseInt(fs.readFileSync(lockFile, 'utf8'), 10); } catch { /* unreadable = stale */ }
+      if (otherPid && pidAlive(otherPid)) return otherPid;
+      try { fs.rmSync(lockFile, { force: true }); } catch { /* retry will surface it */ }
+    }
+  }
+  return -1;
+}
+
 function main() {
+  const startedAtMs = Date.now();
   const opts = parseArgs(process.argv.slice(2));
 
   let config;
@@ -97,11 +124,24 @@ function main() {
 
   fs.mkdirSync(projectPath, { recursive: true });
 
+  const lockFile = path.join(path.dirname(opts.state), '.runner.lock');
+  const lockHolder = acquireLock(lockFile);
+  if (lockHolder !== null) {
+    console.error(`Another runner${lockHolder > 0 ? ` (pid ${lockHolder})` : ''} is already active for this queue. Refusing to start a second one.`);
+    process.exit(1);
+  }
+  const releaseLock = () => { try { fs.rmSync(lockFile, { force: true }); } catch { /* ignore */ } };
+  process.on('exit', releaseLock);
+
   const runId = `run-${runStamp()}`;
   const logger = new Logger(opts.logs, runId);
   const stopFile = path.join(path.dirname(opts.state), '.stop');
-  // A stop flag left behind by a previous run means "stop that run", not this one.
-  try { fs.rmSync(stopFile, { force: true }); } catch { /* ignore */ }
+  // A stop flag from before this process started belongs to a previous run —
+  // delete it. One written during our own startup is a live request: keep it,
+  // and the first stopRequested() check will honor it.
+  try {
+    if (fs.statSync(stopFile).mtimeMs < startedAtMs) fs.rmSync(stopFile, { force: true });
+  } catch { /* no flag */ }
 
   const maxRetries = config.max_retries ?? 4;
   const totals = { claude_calls: 0, cost_usd: 0, claude_ms: 0 };
@@ -118,6 +158,7 @@ function main() {
     log_file: path.basename(logger.logFile),
     events_file: path.basename(logger.eventsFile),
     current_phase: null,
+    claude_pid: null,
     attempt: 0,
     message: 'starting',
     totals,
@@ -138,10 +179,14 @@ function main() {
   const persist = () => saveQueue(opts.queue, queue);
 
   const finish = (status, message, exitCode) => {
+    // Never leave an unattended Claude Code session editing the project after
+    // the runner itself is gone.
+    if (status !== 'passed_all') killActiveClaude();
     logger.section(`RUN ${status.toUpperCase()}: ${message}`);
     logger.event('run_done', { status, message });
-    syncState({ status, message, current_phase: null });
+    syncState({ status, message, current_phase: null, claude_pid: null });
     persist();
+    releaseLock();
     process.exit(exitCode);
   };
 
@@ -224,7 +269,14 @@ function main() {
 
         // 1. Send the prompt to Claude Code.
         logger.event('claude_start', { phase: phase.id, attempt, prompt_chars: currentPrompt.length });
-        const claude = await runClaudeCode({ prompt: currentPrompt, cwd: projectPath, config });
+        const claude = await runClaudeCode({
+          prompt: currentPrompt,
+          cwd: projectPath,
+          config,
+          // Recorded so the dashboard's Kill can take the Claude tree down too.
+          onSpawn: (pid) => syncState({ claude_pid: pid }),
+        });
+        state.claude_pid = null;
         totals.claude_calls += 1;
         totals.claude_ms += claude.durationMs;
         if (claude.parsed && typeof claude.parsed.total_cost_usd === 'number') {
@@ -275,7 +327,8 @@ function main() {
         logger.log(`Verifying ${phase.id} ...`);
         logger.event('verify_start', { phase: phase.id, attempt, steps: (config.verification_steps || []).map((s) => s.name) });
         syncState({ message: `${phase.id}: attempt ${attempt} — verifying` });
-        const verification = verifyPhase(projectPath, config, logger);
+        const verification = await verifyPhase(projectPath, config, logger, phase.id, stopRequested);
+        if (verification.aborted) stopNow();
         const failedSteps = Object.entries(verification.results).filter(([, r]) => !r.passed).map(([n]) => n);
         logger.event('verify_result', { phase: phase.id, attempt, all_passed: verification.allPassed, failed_steps: failedSteps });
 

@@ -21,9 +21,24 @@ const failures = [];
 
 function readJson(f) { return JSON.parse(fs.readFileSync(f, 'utf8')); }
 
+// OneDrive/AV can hold transient locks on just-written files; a plain rmSync
+// then throws EBUSY/EPERM and takes the whole suite down. Retry briefly.
+function rmrf(target) {
+  for (let attempt = 0; ; attempt++) {
+    try {
+      fs.rmSync(target, { recursive: true, force: true, maxRetries: 5, retryDelay: 100 });
+      return;
+    } catch (err) {
+      if (attempt >= 4) throw err;
+      const end = Date.now() + 200 * (attempt + 1);
+      while (Date.now() < end) { /* brief blocking wait */ }
+    }
+  }
+}
+
 function setupCase(name, { phases, calls, config = {} }) {
   const dir = path.join(TMP, name);
-  fs.rmSync(dir, { recursive: true, force: true });
+  rmrf(dir);
   const project = path.join(dir, 'target');
   fs.mkdirSync(project, { recursive: true });
   fs.writeFileSync(path.join(project, 'mock-scenario.json'), JSON.stringify({ calls }, null, 2));
@@ -85,7 +100,7 @@ function test(name, fn) {
 }
 
 console.log('prompt-chain-runner test suite\n');
-fs.rmSync(TMP, { recursive: true, force: true });
+rmrf(TMP);
 
 // ---------------------------------------------------------------- dry run
 test('dry-run validates and executes nothing', () => {
@@ -137,6 +152,70 @@ test('happy path: two phases pass, each gets its own commit', () => {
   assert.strictEqual(state.status, 'passed_all');
   assert.strictEqual(state.totals.claude_calls, 2);
   assert.ok(state.totals.cost_usd > 0, 'cost accumulated');
+  assert.ok(!fs.existsSync(path.join(c.dir, '.runner.lock')), 'lock released after the run');
+});
+
+// ---------------------------------------------------------------- CLI contract
+test('Claude Code is invoked with the exact unattended-mode flags', () => {
+  const c = setupCase('cli-contract', {
+    phases: [{ id: 'p1', prompt: 'anything' }],
+    calls: [{ files: { 'app.txt': 'GOOD' } }],
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  const argv = claudeCalls(c)[0].argv;
+  const flat = argv.join(' ');
+  assert.ok(argv.includes('-p'), `-p missing from: ${flat}`);
+  assert.match(flat, /--output-format json/, `--output-format json missing from: ${flat}`);
+  assert.ok(argv.includes('--dangerously-skip-permissions'), `--dangerously-skip-permissions missing from: ${flat}`);
+});
+
+// ---------------------------------------------------------------- single-instance lock
+test('a second runner refuses to start while the lock is held by a live pid', () => {
+  const c = setupCase('lock-live', {
+    phases: [{ id: 'p1', prompt: 'anything' }],
+    calls: [{ files: { 'app.txt': 'GOOD' } }],
+  });
+  // Hold the lock with this test process's own (definitely alive) pid.
+  fs.writeFileSync(path.join(c.dir, '.runner.lock'), String(process.pid));
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 1, `expected exit 1, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  assert.match(res.stderr, /already active/i, 'explains why it refused');
+  assert.strictEqual(claudeCalls(c).length, 0, 'no Claude calls made');
+  assert.strictEqual(readJson(c.queueFile).phases[0].status ?? 'pending', 'pending', 'queue untouched');
+});
+
+test('a lock held by a dead pid is stolen and the run proceeds', () => {
+  const c = setupCase('lock-stale', {
+    phases: [{ id: 'p1', prompt: 'anything' }],
+    calls: [{ files: { 'app.txt': 'GOOD' } }],
+  });
+  const dead = spawnSync('node', ['-e', ''], { encoding: 'utf8' }); // exits immediately
+  fs.writeFileSync(path.join(c.dir, '.runner.lock'), String(dead.pid ?? 999999));
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  assert.strictEqual(readJson(c.queueFile).phases[0].status, 'passed');
+});
+
+// ---------------------------------------------------------------- stop between verify steps
+test('a stop requested mid-verification skips the remaining steps and never commits', () => {
+  const c = setupCase('stop-mid-verify', {
+    phases: [{ id: 'p1', prompt: 'anything' }],
+    calls: [{ files: { 'app.txt': 'GOOD' } }],
+    config: {
+      verification_steps: [
+        { name: 'check', command: `node "${CHECK}"` },
+        { name: 'drop-stop', command: `node "${path.join(__dirname, 'write-stop.js')}"` },
+        { name: 'never-runs', command: `node "${CHECK}"` },
+      ],
+    },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 3, `expected exit 3 (stopped), got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  assert.strictEqual(readJson(c.stateFile).status, 'stopped');
+  assert.ok(!(res.stdout + res.stderr).includes('verify [never-runs]'), 'third step was never run');
+  assert.notStrictEqual(readJson(c.queueFile).phases[0].status, 'passed', 'phase not marked passed');
+  assert.strictEqual(gitLog(c).length, 0, 'nothing committed');
 });
 
 // ---------------------------------------------------------------- retry loop
