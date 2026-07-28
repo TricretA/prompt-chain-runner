@@ -1,0 +1,22 @@
+{
+  "name": "prompt-chain-runner",
+  "version": "1.0.0",
+  "description": "Autonomous prompt-chain orchestrator for Claude Code: sends phases to Claude Code unattended, gates every phase behind real build/lint/test verification, auto-retries with error-driven fix prompts, commits each passing phase to git, and streams the whole run to a live web dashboard.",
+  "main": "runner.js",
+  "scripts": {
+    "start": "node runner.js",
+    "dashboard": "node dashboard.js --open",
+    "test": "node test/run-tests.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "claude-code",
+    "orchestrator",
+    "automation",
+    "prompt-chain",
+    "ai-agent"
+  ],
+  "license": "MIT"
+}

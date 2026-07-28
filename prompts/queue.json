@@ -1,0 +1,19 @@
+{
+  "project_path": "./target-project",
+  "phases": [
+    {
+      "id": "phase-1",
+      "prompt": "Set up a Next.js project with TypeScript and Tailwind. Create the folder structure for pages, components, and lib.",
+      "status": "pending",
+      "retries": 0,
+      "commit_hash": null
+    },
+    {
+      "id": "phase-2",
+      "prompt": "Build the landing page UI. Use the components folder created in phase-1.",
+      "status": "pending",
+      "retries": 0,
+      "commit_hash": null
+    }
+  ]
+}

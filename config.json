@@ -1,0 +1,18 @@
+{
+  "claude_command": "claude",
+  "claude_args": [],
+  "claude_timeout_ms": 3600000,
+  "max_retries": 4,
+  "stop_on_first_failure": false,
+  "output_capture_limit": 20000,
+  "fix_prompt_output_limit": 8000,
+  "verify_timeout_ms": 600000,
+  "dashboard_port": 4747,
+  "verification_steps": [
+    { "name": "install", "command": "npm install" },
+    { "name": "typecheck", "command": "npx tsc --noEmit" },
+    { "name": "lint", "command": "npm run lint" },
+    { "name": "build", "command": "npm run build" },
+    { "name": "test", "command": "npm test -- --run" }
+  ]
+}

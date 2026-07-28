@@ -1,0 +1,14 @@
+# Run artifacts
+logs/*.log
+logs/*.jsonl
+state.json
+.stop
+
+# The project Claude Code builds lives in its own repo, not this one
+target-project/**
+!target-project/.gitkeep
+
+# Test workspaces
+test/.tmp/
+
+node_modules/

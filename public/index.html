@@ -1,0 +1,648 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Prompt Chain Runner</title>
+<style>
+  :root {
+    color-scheme: light;
+    --page: #f9f9f7;
+    --surface: #fcfcfb;
+    --ink: #0b0b0b;
+    --ink-2: #52514e;
+    --muted: #898781;
+    --grid: #e1e0d9;
+    --border: rgba(11, 11, 11, 0.10);
+    --accent: #2a78d6;
+    --good: #0ca30c;
+    --good-text: #006300;
+    --warning: #fab219;
+    --serious: #ec835a;
+    --critical: #d03b3b;
+    --chip-good-bg: rgba(12, 163, 12, 0.10);
+    --chip-warn-bg: rgba(250, 178, 25, 0.14);
+    --chip-crit-bg: rgba(208, 59, 59, 0.10);
+    --chip-run-bg: rgba(42, 120, 214, 0.10);
+    --chip-idle-bg: rgba(11, 11, 11, 0.05);
+    --mono: ui-monospace, "Cascadia Code", Consolas, Menlo, monospace;
+  }
+  :root[data-theme="dark"] {
+    color-scheme: dark;
+    --page: #0d0d0d;
+    --surface: #1a1a19;
+    --ink: #ffffff;
+    --ink-2: #c3c2b7;
+    --muted: #898781;
+    --grid: #2c2c2a;
+    --border: rgba(255, 255, 255, 0.10);
+    --accent: #3987e5;
+    --good-text: #0ca30c;
+    --chip-good-bg: rgba(12, 163, 12, 0.16);
+    --chip-warn-bg: rgba(250, 178, 25, 0.14);
+    --chip-crit-bg: rgba(208, 59, 59, 0.18);
+    --chip-run-bg: rgba(57, 135, 229, 0.16);
+    --chip-idle-bg: rgba(255, 255, 255, 0.06);
+  }
+  @media (prefers-color-scheme: dark) {
+    :root:not([data-theme="light"]) {
+      color-scheme: dark;
+      --page: #0d0d0d;
+      --surface: #1a1a19;
+      --ink: #ffffff;
+      --ink-2: #c3c2b7;
+      --muted: #898781;
+      --grid: #2c2c2a;
+      --border: rgba(255, 255, 255, 0.10);
+      --accent: #3987e5;
+      --good-text: #0ca30c;
+      --chip-good-bg: rgba(12, 163, 12, 0.16);
+      --chip-warn-bg: rgba(250, 178, 25, 0.14);
+      --chip-crit-bg: rgba(208, 59, 59, 0.18);
+      --chip-run-bg: rgba(57, 135, 229, 0.16);
+      --chip-idle-bg: rgba(255, 255, 255, 0.06);
+    }
+  }
+
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: var(--page);
+    color: var(--ink);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  a { color: var(--accent); }
+
+  header {
+    display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
+    padding: 14px 20px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--grid);
+    position: sticky; top: 0; z-index: 5;
+  }
+  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: 0.01em; }
+  header .sub { color: var(--muted); font-size: 12px; }
+  .spacer { flex: 1; }
+
+  .pill {
+    display: inline-flex; align-items: center; gap: 6px;
+    padding: 3px 10px; border-radius: 999px;
+    font-size: 12px; font-weight: 600;
+    border: 1px solid var(--border);
+    background: var(--chip-idle-bg); color: var(--ink-2);
+  }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .pill.running { background: var(--chip-run-bg); color: var(--ink); }
+  .pill.running .dot { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
+  .pill.passed_all { background: var(--chip-good-bg); color: var(--good-text); }
+  .pill.passed_all .dot { background: var(--good); }
+  .pill.stuck, .pill.error { background: var(--chip-crit-bg); color: var(--critical); }
+  .pill.stuck .dot, .pill.error .dot { background: var(--critical); }
+  .pill.stopped .dot { background: var(--serious); }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+  button {
+    font: inherit; font-size: 13px; font-weight: 600;
+    padding: 6px 14px; border-radius: 8px; cursor: pointer;
+    border: 1px solid var(--border);
+    background: var(--surface); color: var(--ink);
+  }
+  button:hover { border-color: var(--muted); }
+  button:disabled { opacity: 0.45; cursor: not-allowed; }
+  button.primary { background: var(--accent); border-color: transparent; color: #fff; }
+  button.danger { color: var(--critical); }
+  label.opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ink-2); user-select: none; }
+
+  main { padding: 18px 20px 40px; max-width: 1500px; margin: 0 auto; }
+
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 18px; }
+  .tile {
+    background: var(--surface); border: 1px solid var(--border);
+    border-radius: 12px; padding: 12px 16px;
+  }
+  .tile .label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
+  .tile .value { font-size: 26px; font-weight: 650; margin-top: 2px; }
+  .tile .value small { font-size: 14px; font-weight: 500; color: var(--ink-2); }
+  .tile .hint { font-size: 12px; color: var(--ink-2); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .meter { height: 4px; border-radius: 4px; background: var(--grid); margin-top: 10px; overflow: hidden; }
+  .meter > div { height: 100%; border-radius: 4px; background: var(--good); transition: width 0.4s ease; }
+
+  .cols { display: grid; grid-template-columns: minmax(340px, 5fr) minmax(380px, 7fr); gap: 16px; align-items: start; }
+  @media (max-width: 980px) { .cols { grid-template-columns: 1fr; } }
+
+  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
+  .panel > .head {
+    display: flex; align-items: center; gap: 10px;
+    padding: 10px 14px; border-bottom: 1px solid var(--grid);
+    font-weight: 650; font-size: 13px;
+  }
+  .panel > .head .count { color: var(--muted); font-weight: 500; }
+
+  .phase {
+    border-bottom: 1px solid var(--grid); padding: 10px 14px;
+  }
+  .phase:last-child { border-bottom: 0; }
+  .phase .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+  .phase .num { color: var(--muted); font-size: 12px; width: 2.2em; flex: none; font-variant-numeric: tabular-nums; }
+  .phase .id { font-weight: 650; }
+  .phase .meta { color: var(--muted); font-size: 12px; margin-left: auto; display: flex; gap: 10px; align-items: center; }
+  .phase .hash { font-family: var(--mono); font-size: 11px; color: var(--ink-2); background: var(--chip-idle-bg); border-radius: 6px; padding: 1px 6px; }
+
+  .chip {
+    display: inline-flex; align-items: center; gap: 5px;
+    font-size: 11px; font-weight: 650; letter-spacing: 0.02em;
+    padding: 2px 9px; border-radius: 999px; border: 1px solid var(--border);
+    background: var(--chip-idle-bg); color: var(--ink-2); flex: none;
+  }
+  .chip.passed { background: var(--chip-good-bg); color: var(--good-text); }
+  .chip.running { background: var(--chip-run-bg); color: var(--ink); }
+  .chip.failed_retry { background: var(--chip-warn-bg); color: var(--ink); }
+  .chip.stuck { background: var(--chip-crit-bg); color: var(--critical); }
+
+  details.prompt { margin-top: 6px; }
+  details.prompt summary, details.vout summary {
+    cursor: pointer; font-size: 12px; color: var(--ink-2); user-select: none;
+  }
+  details pre {
+    margin: 6px 0 2px; padding: 10px; border-radius: 8px;
+    background: var(--page); border: 1px solid var(--grid);
+    font-family: var(--mono); font-size: 12px;
+    white-space: pre-wrap; word-break: break-word;
+    max-height: 320px; overflow: auto;
+  }
+  .vsteps { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
+  .vstep { font-size: 12px; color: var(--ink-2); }
+  .vstep .ok { color: var(--good-text); font-weight: 650; }
+  .vstep .fail { color: var(--critical); font-weight: 650; }
+
+  .tabs { display: flex; gap: 2px; margin-left: auto; }
+  .tabs button { border: 0; background: none; color: var(--muted); padding: 4px 10px; border-radius: 6px; font-size: 12px; }
+  .tabs button.active { background: var(--chip-idle-bg); color: var(--ink); }
+  select {
+    font: inherit; font-size: 12px; color: var(--ink);
+    background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px;
+    max-width: 220px;
+  }
+
+  #feed { max-height: 640px; overflow: auto; padding: 6px 0; }
+  .ev { display: flex; gap: 10px; padding: 4px 14px; font-size: 13px; align-items: baseline; }
+  .ev:hover { background: var(--chip-idle-bg); }
+  .ev .t { color: var(--muted); font-family: var(--mono); font-size: 11px; flex: none; width: 62px; }
+  .ev .icon { flex: none; width: 1.3em; text-align: center; }
+  .ev .body { min-width: 0; flex: 1; color: var(--ink-2); }
+  .ev .body b { color: var(--ink); font-weight: 650; }
+  .ev.good .icon { color: var(--good-text); }
+  .ev.bad .icon { color: var(--critical); }
+  .ev.warn .icon { color: var(--serious); }
+  .ev.info .icon { color: var(--accent); }
+  .ev details { display: inline-block; }
+  .ev details summary { cursor: pointer; color: var(--accent); font-size: 12px; }
+  .ev details pre { max-width: 100%; }
+
+  #rawlog {
+    margin: 0; padding: 12px 14px; max-height: 640px; overflow: auto;
+    font-family: var(--mono); font-size: 12px; line-height: 1.45;
+    white-space: pre-wrap; word-break: break-word; color: var(--ink-2);
+  }
+
+  .empty { padding: 28px 16px; text-align: center; color: var(--muted); font-size: 13px; }
+  .empty code { font-family: var(--mono); background: var(--chip-idle-bg); padding: 1px 6px; border-radius: 6px; }
+
+  footer { margin-top: 20px; color: var(--muted); font-size: 11px; font-family: var(--mono); }
+  footer div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+  #toast {
+    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
+    background: var(--ink); color: var(--page);
+    padding: 8px 16px; border-radius: 8px; font-size: 13px;
+    opacity: 0; pointer-events: none; transition: opacity 0.25s; z-index: 20;
+    max-width: 80vw;
+  }
+  #toast.show { opacity: 1; }
+  .offline-banner {
+    display: none; padding: 8px 20px; font-size: 12px; font-weight: 600;
+    background: var(--chip-crit-bg); color: var(--critical);
+  }
+  body.offline .offline-banner { display: block; }
+</style>
+</head>
+<body>
+<header>
+  <div>
+    <h1>Prompt Chain Runner</h1>
+    <div class="sub" id="run-id">no runs yet</div>
+  </div>
+  <span class="pill" id="status-pill"><span class="dot"></span><span id="status-text">idle</span></span>
+  <div class="spacer"></div>
+  <label class="opt" title="Reset phases marked stuck and retry them"><input type="checkbox" id="opt-retry-stuck"> retry stuck</label>
+  <button class="primary" id="btn-start">&#9654; Start run</button>
+  <button id="btn-stop" title="Graceful: halts after the current step">&#9632; Stop</button>
+  <button class="danger" id="btn-kill" title="Force-kills the runner process tree">Kill</button>
+  <button id="btn-theme" title="Toggle light/dark">&#9681;</button>
+</header>
+<div class="offline-banner">Dashboard server unreachable — is <code>node dashboard.js</code> still running?</div>
+
+<main>
+  <section class="tiles">
+    <div class="tile">
+      <div class="label">Phases passed</div>
+      <div class="value"><span id="t-passed">–</span><small id="t-total"></small></div>
+      <div class="meter"><div id="t-meter" style="width:0%"></div></div>
+    </div>
+    <div class="tile">
+      <div class="label">Current phase</div>
+      <div class="value" id="t-current" style="font-size:18px">–</div>
+      <div class="hint" id="t-attempt"></div>
+    </div>
+    <div class="tile">
+      <div class="label">Claude calls</div>
+      <div class="value" id="t-calls">–</div>
+      <div class="hint" id="t-claude-time"></div>
+    </div>
+    <div class="tile">
+      <div class="label">Cost</div>
+      <div class="value" id="t-cost">–</div>
+      <div class="hint">reported by Claude Code</div>
+    </div>
+    <div class="tile">
+      <div class="label">Elapsed</div>
+      <div class="value" id="t-elapsed">–</div>
+      <div class="hint" id="t-updated"></div>
+    </div>
+  </section>
+
+  <div class="cols">
+    <section class="panel" id="pipeline-panel">
+      <div class="head">Phase pipeline <span class="count" id="phase-count"></span></div>
+      <div id="phases"><div class="empty">Loading…</div></div>
+    </section>
+
+    <section class="panel">
+      <div class="head">
+        <span id="feed-title">Activity</span>
+        <select id="run-select" title="Which run to inspect"><option value="">live</option></select>
+        <div class="tabs">
+          <button id="tab-feed" class="active">Activity</button>
+          <button id="tab-raw">Raw log</button>
+        </div>
+      </div>
+      <div id="feed"><div class="empty">No activity yet. Start a run to see every step live.</div></div>
+      <pre id="rawlog" style="display:none"></pre>
+    </section>
+  </div>
+
+  <footer id="paths"></footer>
+</main>
+<div id="toast"></div>
+
+<script>
+'use strict';
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
+
+// ---------- theme ----------
+const themeBtn = $('btn-theme');
+function applyTheme(t) {
+  if (t) document.documentElement.setAttribute('data-theme', t);
+  else document.documentElement.removeAttribute('data-theme');
+}
+applyTheme(localStorage.getItem('pcr-theme'));
+themeBtn.onclick = () => {
+  const cur = document.documentElement.getAttribute('data-theme');
+  const sysDark = matchMedia('(prefers-color-scheme: dark)').matches;
+  const next = cur ? (cur === 'dark' ? 'light' : 'dark') : (sysDark ? 'light' : 'dark');
+  localStorage.setItem('pcr-theme', next);
+  applyTheme(next);
+};
+
+// ---------- toast ----------
+let toastTimer;
+function toast(msg) {
+  const el = $('toast');
+  el.textContent = msg;
+  el.classList.add('show');
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
+}
+
+// ---------- state ----------
+let overview = null;
+let selectedRun = '';           // '' = follow the live/latest run
+let feedFile = null;            // events file currently being tailed
+let feedOffset = 0;
+let events = [];
+let rawFile = null;
+let rawOffset = 0;
+let currentTab = 'feed';
+
+const STATUS_LABEL = {
+  pending: '○ pending',
+  running: '▶ running',
+  passed: '✓ passed',
+  failed_retry: '⚠ retrying',
+  stuck: '✕ stuck',
+};
+const RUN_LABEL = {
+  running: '▶ running',
+  passed_all: '✓ all phases passed',
+  stuck: '✕ stuck',
+  stopped: '■ stopped',
+  error: '✕ error',
+  interrupted: '■ interrupted',
+};
+
+function fmtDur(ms) {
+  if (ms == null || !isFinite(ms) || ms < 0) return '–';
+  const s = Math.floor(ms / 1000);
+  if (s < 60) return s + 's';
+  const m = Math.floor(s / 60);
+  if (m < 60) return m + 'm ' + (s % 60) + 's';
+  return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
+}
+function fmtTime(ts) {
+  try { return new Date(ts).toLocaleTimeString([], { hour12: false }); } catch { return ''; }
+}
+
+// ---------- rendering ----------
+function renderHeader() {
+  const st = overview?.state;
+  const active = overview?.runner_active;
+  const status = st ? (st.status === 'running' && !active ? 'crashed' : st.status) : 'idle';
+  const pill = $('status-pill');
+  pill.className = 'pill ' + (status === 'crashed' ? 'error' : status);
+  $('status-text').textContent =
+    status === 'crashed' ? '✕ crashed (process gone)' : (RUN_LABEL[status] || status);
+  $('run-id').textContent = st ? `${st.run_id}${overview.stop_flag && active ? ' — stop requested' : ''}` : 'no runs yet';
+  $('btn-start').disabled = Boolean(active);
+  $('btn-stop').disabled = !active;
+  $('btn-kill').disabled = !active;
+}
+
+function renderTiles() {
+  const st = overview?.state;
+  const phases = st?.phases || overview?.queue?.phases || [];
+  const passed = phases.filter((p) => p.status === 'passed').length;
+  $('t-passed').textContent = phases.length ? passed : '–';
+  $('t-total').textContent = phases.length ? ' / ' + phases.length : '';
+  $('t-meter').style.width = phases.length ? (100 * passed / phases.length) + '%' : '0%';
+
+  $('t-current').textContent = st?.current_phase || (st ? '—' : '–');
+  $('t-attempt').textContent = st?.message || '';
+
+  $('t-calls').textContent = st?.totals?.claude_calls ?? '–';
+  $('t-claude-time').textContent = st?.totals?.claude_ms ? fmtDur(st.totals.claude_ms) + ' in Claude Code' : '';
+  const cost = st?.totals?.cost_usd;
+  $('t-cost').textContent = cost != null ? '$' + Number(cost).toFixed(2) : '–';
+
+  if (st) {
+    const end = (st.status === 'running' && overview.runner_active) ? Date.now() : new Date(st.updated_at).getTime();
+    $('t-elapsed').textContent = fmtDur(end - new Date(st.started_at).getTime());
+    $('t-updated').textContent = 'updated ' + fmtTime(st.updated_at);
+  } else {
+    $('t-elapsed').textContent = '–';
+    $('t-updated').textContent = '';
+  }
+}
+
+// Latest verification info per phase, distilled from the event feed.
+function verifySummaryByPhase() {
+  const map = {};
+  for (const ev of events) {
+    if (ev.type === 'verify_start') map[ev.phase] = [];
+    else if (ev.type === 'verify_step') (map[ev.phase] = map[ev.phase] || []).push(ev);
+  }
+  return map;
+}
+
+function renderPhases() {
+  const queuePhases = overview?.queue?.phases || [];
+  const statePhases = new Map((overview?.state?.phases || []).map((p) => [p.id, p]));
+  const box = $('phases');
+  $('phase-count').textContent = queuePhases.length ? `${queuePhases.length} phases` : '';
+  if (!queuePhases.length) {
+    box.innerHTML = '<div class="empty">No phases found. Fill in <code>prompts/queue.json</code> and refresh.</div>';
+    return;
+  }
+  const vmap = verifySummaryByPhase();
+  const openSet = new Set([...box.querySelectorAll('details[open]')].map((d) => d.dataset.key));
+
+  box.innerHTML = queuePhases.map((p, i) => {
+    const live = statePhases.get(p.id) || p;
+    const status = live.status || 'pending';
+    const vsteps = (vmap[p.id] || []).map((ev) => `
+      <div class="vstep">
+        <span class="${ev.passed ? 'ok' : 'fail'}">${ev.passed ? '✓' : '✕'}</span>
+        ${esc(ev.step)} <span style="color:var(--muted)">(${fmtDur(ev.duration_ms)})</span>
+        ${!ev.passed && ev.output ? `<details class="vout" data-key="v-${esc(p.id)}-${esc(ev.step)}"><summary>error output</summary><pre>${esc(ev.output)}</pre></details>` : ''}
+      </div>`).join('');
+    return `
+    <div class="phase">
+      <div class="row">
+        <span class="num">${i + 1}.</span>
+        <span class="id">${esc(p.id)}</span>
+        <span class="chip ${esc(status)}">${STATUS_LABEL[status] || esc(status)}</span>
+        <span class="meta">
+          ${live.retries ? `<span title="retries used">↻ ${live.retries}</span>` : ''}
+          ${live.commit_hash ? `<span class="hash" title="${esc(live.commit_hash)}">${esc(String(live.commit_hash).slice(0, 8))}</span>` : ''}
+        </span>
+      </div>
+      <details class="prompt" data-key="p-${esc(p.id)}">
+        <summary>prompt</summary>
+        <pre>${esc(p.prompt)}</pre>
+      </details>
+      ${vsteps ? `<div class="vsteps">${vsteps}</div>` : ''}
+    </div>`;
+  }).join('');
+
+  for (const d of box.querySelectorAll('details')) {
+    if (openSet.has(d.dataset.key)) d.open = true;
+  }
+}
+
+const EV_RENDER = {
+  run_start: (e) => ['info', '▶', `run started — ${e.phases?.length ?? '?'} phases, max ${e.max_retries} retries each`],
+  phase_start: (e) => ['info', '■', `<b>${esc(e.phase)}</b> started (${e.index + 1}/${e.total})`],
+  attempt_start: (e) => ['info', '↻', `<b>${esc(e.phase)}</b> attempt ${e.attempt}/${e.max_attempts} (${esc(e.kind)} prompt)`],
+  claude_start: (e) => ['info', '✦', `sending prompt to Claude Code (${(e.prompt_chars / 1000).toFixed(1)}k chars)`],
+  claude_done: (e) => ['good', '✦', `Claude Code finished in ${fmtDur(e.duration_ms)}${e.cost_usd != null ? ` — $${e.cost_usd.toFixed ? e.cost_usd.toFixed(4) : e.cost_usd}` : ''}${e.result ? ` <details><summary>result</summary><pre>${esc(e.result)}</pre></details>` : ''}`],
+  claude_error: (e) => ['bad', '✕', `Claude Code call failed <details><summary>error</summary><pre>${esc(e.error)}</pre></details>`],
+  verify_start: (e) => ['info', '⚖', `verifying <b>${esc(e.phase)}</b>: ${e.steps?.map(esc).join(' → ') || 'no steps configured'}`],
+  verify_step_start: (e) => ['info', '⋯', `running check <b>${esc(e.step)}</b> — <span style="font-family:var(--mono)">${esc(e.command)}</span>`],
+  verify_step: (e) => e.passed
+    ? ['good', '✓', `check <b>${esc(e.step)}</b> passed (${fmtDur(e.duration_ms)})`]
+    : ['bad', '✕', `check <b>${esc(e.step)}</b> FAILED (exit ${e.exit_code ?? 'killed'}) <details><summary>output</summary><pre>${esc(e.output)}</pre></details>`],
+  verify_result: (e) => e.all_passed
+    ? ['good', '✓', `<b>${esc(e.phase)}</b> passed all verification`]
+    : ['warn', '⚠', `<b>${esc(e.phase)}</b> failed verification: ${e.failed_steps?.map(esc).join(', ')}`],
+  fix_prompt: (e) => ['warn', '✎', `auto-generated fix prompt for <b>${esc(e.phase)}</b> <details><summary>view prompt</summary><pre>${esc(e.prompt)}</pre></details>`],
+  commit: (e) => ['good', '⎇', `committed <b>${esc(e.phase)}</b> → <span style="font-family:var(--mono)">${esc(String(e.hash).slice(0, 8))}</span>`],
+  phase_passed: (e) => ['good', '⚑', `<b>${esc(e.phase)}</b> PASSED after ${e.retries} ${e.retries === 1 ? 'retry' : 'retries'}`],
+  phase_stuck: (e) => ['bad', '⛔', `<b>${esc(e.phase)}</b> STUCK after ${e.retries} attempts (${esc(e.reason || '')})`],
+  stop_requested: () => ['warn', '■', 'stop requested — halting gracefully'],
+  run_done: (e) => [e.status === 'passed_all' ? 'good' : e.status === 'stopped' ? 'warn' : 'bad', '⚑', `run finished: <b>${esc(e.status)}</b> — ${esc(e.message)}`],
+  run_error: (e) => ['bad', '✕', `runner crashed <details><summary>stack</summary><pre>${esc(e.error)}</pre></details>`],
+};
+
+function renderNewEvents(newOnes) {
+  const feed = $('feed');
+  if (events.length && feed.querySelector('.empty')) feed.innerHTML = '';
+  const stick = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
+  const frag = document.createDocumentFragment();
+  for (const ev of newOnes) {
+    const fn = EV_RENDER[ev.type];
+    if (!fn) continue;
+    const [cls, icon, html] = fn(ev);
+    const div = document.createElement('div');
+    div.className = 'ev ' + cls;
+    div.innerHTML = `<span class="t">${fmtTime(ev.ts)}</span><span class="icon">${icon}</span><span class="body">${html}</span>`;
+    frag.appendChild(div);
+  }
+  feed.appendChild(frag);
+  while (feed.children.length > 1500) feed.removeChild(feed.firstChild);
+  if (stick) feed.scrollTop = feed.scrollHeight;
+}
+
+function resetFeed() {
+  events = [];
+  feedOffset = 0;
+  $('feed').innerHTML = '<div class="empty">Loading events…</div>';
+  rawOffset = 0;
+  $('rawlog').textContent = '';
+}
+
+// ---------- data fetching ----------
+async function api(path, opts) {
+  const res = await fetch(path, opts);
+  if (!res.ok) {
+    let msg = res.status + ' ' + res.statusText;
+    try { const b = await res.json(); if (b.error) msg = b.error; } catch { /* ignore */ }
+    throw new Error(msg);
+  }
+  return res.json();
+}
+
+function currentRunInfo() {
+  if (!overview) return null;
+  if (selectedRun) return overview.runs.find((r) => r.run_id === selectedRun) || null;
+  if (overview.state) {
+    return overview.runs.find((r) => r.run_id === overview.state.run_id) || overview.runs[0] || null;
+  }
+  return overview.runs[0] || null;
+}
+
+function renderRunSelect() {
+  const sel = $('run-select');
+  const runs = overview?.runs || [];
+  const want = ['<option value="">live (latest)</option>']
+    .concat(runs.map((r) => `<option value="${esc(r.run_id)}"${r.run_id === selectedRun ? ' selected' : ''}>${esc(r.run_id)}</option>`))
+    .join('');
+  if (sel.dataset.rendered !== want) { sel.innerHTML = want; sel.dataset.rendered = want; }
+}
+
+async function pollTails() {
+  const info = currentRunInfo();
+  if (!info) return;
+  if (info.events && info.events !== feedFile) { feedFile = info.events; resetFeed(); }
+  if (info.log) rawFile = info.log;
+
+  if (feedFile) {
+    try {
+      let guard = 0;
+      while (guard++ < 20) {
+        const r = await api(`/api/tail?file=${encodeURIComponent(feedFile)}&offset=${feedOffset}`);
+        if (r.offset === feedOffset && !r.data) break;
+        feedOffset = r.offset;
+        if (r.data) {
+          const fresh = r.data.split('\n').filter(Boolean).map((line) => {
+            try { return JSON.parse(line); } catch { return null; }
+          }).filter(Boolean);
+          events.push(...fresh);
+          renderNewEvents(fresh);
+          renderPhases();
+        }
+        if (r.offset >= r.size) break;
+      }
+    } catch { /* transient */ }
+  }
+
+  if (rawFile && currentTab === 'raw') {
+    try {
+      let guard = 0;
+      while (guard++ < 20) {
+        const r = await api(`/api/tail?file=${encodeURIComponent(rawFile)}&offset=${rawOffset}`);
+        if (r.offset === rawOffset && !r.data) break;
+        rawOffset = r.offset;
+        if (r.data) {
+          const el = $('rawlog');
+          const stick = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
+          el.textContent += r.data;
+          if (el.textContent.length > 1_500_000) el.textContent = el.textContent.slice(-1_000_000);
+          if (stick) el.scrollTop = el.scrollHeight;
+        }
+        if (r.offset >= r.size) break;
+      }
+    } catch { /* transient */ }
+  }
+}
+
+async function poll() {
+  try {
+    overview = await api('/api/overview');
+    document.body.classList.remove('offline');
+    renderHeader();
+    renderTiles();
+    renderPhases();
+    renderRunSelect();
+    $('paths').innerHTML = `
+      <div>root: ${esc(overview.root)}</div>
+      <div>project: ${esc(overview.state?.project_path || overview.queue?.project_path || '?')}</div>`;
+    await pollTails();
+  } catch {
+    document.body.classList.add('offline');
+  }
+}
+
+// ---------- controls ----------
+$('btn-start').onclick = async () => {
+  try {
+    const r = await api('/api/run/start', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ retryStuck: $('opt-retry-stuck').checked }),
+    });
+    toast(r.ok ? `Runner started (pid ${r.pid})` : r.error);
+    selectedRun = '';
+    setTimeout(poll, 600);
+  } catch (e) { toast('Start failed: ' + e.message); }
+};
+$('btn-stop').onclick = async () => {
+  try { const r = await api('/api/run/stop', { method: 'POST' }); toast(r.note || 'Stop requested'); }
+  catch (e) { toast('Stop failed: ' + e.message); }
+};
+$('btn-kill').onclick = async () => {
+  if (!confirm('Force-kill the runner process? The current phase will be left half-done (git has the last good commit).')) return;
+  try { const r = await api('/api/run/kill', { method: 'POST' }); toast(r.killed ? `Killed pid ${r.killed}` : (r.note || 'Nothing to kill')); setTimeout(poll, 600); }
+  catch (e) { toast('Kill failed: ' + e.message); }
+};
+$('run-select').onchange = (e) => {
+  selectedRun = e.target.value;
+  feedFile = null; rawFile = null;
+  resetFeed();
+  poll();
+};
+$('tab-feed').onclick = () => switchTab('feed');
+$('tab-raw').onclick = () => switchTab('raw');
+function switchTab(tab) {
+  currentTab = tab;
+  $('tab-feed').classList.toggle('active', tab === 'feed');
+  $('tab-raw').classList.toggle('active', tab === 'raw');
+  $('feed').style.display = tab === 'feed' ? '' : 'none';
+  $('rawlog').style.display = tab === 'raw' ? '' : 'none';
+  if (tab === 'raw') pollTails();
+}
+
+poll();
+setInterval(poll, 1500);
+</script>
+</body>
+</html>
