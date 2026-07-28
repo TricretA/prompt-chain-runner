@@ -12,28 +12,31 @@
 const http = require('http');
 const fs = require('fs');
 const path = require('path');
-const { spawn, spawnSync } = require('child_process');
-const { readJson } = require('./lib/util');
+const { spawn } = require('child_process');
+const { readJson, atomicWriteJson, slugify, pidAlive, pidLooksLikeNode } = require('./lib/util');
 const { readState, writeState } = require('./lib/state');
 const { killTree } = require('./lib/claude');
-
-const ROOT = __dirname;
-const LOGS_DIR = path.join(ROOT, 'logs');
-const STATE_FILE = path.join(ROOT, 'state.json');
-const QUEUE_FILE = path.join(ROOT, 'prompts', 'queue.json');
-const CONFIG_FILE = path.join(ROOT, 'config.json');
-const STOP_FILE = path.join(ROOT, '.stop');
-const INDEX_FILE = path.join(ROOT, 'public', 'index.html');
-const MAX_TAIL_CHUNK = 512 * 1024;
+const { parsePrompts } = require('./lib/parse-prompts');
 
 function parseArgs(argv) {
-  const opts = { port: null, open: false };
+  const opts = { port: null, open: false, root: null };
   for (let i = 0; i < argv.length; i++) {
     if (argv[i] === '--port') opts.port = parseInt(argv[++i], 10);
     else if (argv[i] === '--open') opts.open = true;
+    else if (argv[i] === '--root') opts.root = path.resolve(argv[++i]); // data root override (tests)
   }
   return opts;
 }
+
+const ROOT = __dirname;
+const DATA_ROOT = parseArgs(process.argv.slice(2)).root || ROOT;
+const LOGS_DIR = path.join(DATA_ROOT, 'logs');
+const STATE_FILE = path.join(DATA_ROOT, 'state.json');
+const QUEUE_FILE = path.join(DATA_ROOT, 'prompts', 'queue.json');
+const CONFIG_FILE = path.join(DATA_ROOT, 'config.json');
+const STOP_FILE = path.join(DATA_ROOT, '.stop');
+const INDEX_FILE = path.join(ROOT, 'public', 'index.html');
+const MAX_TAIL_CHUNK = 512 * 1024;
 
 function safeReadJson(file) {
   try { return readJson(file); } catch { return null; }
@@ -42,26 +45,6 @@ function safeReadJson(file) {
 const opts = parseArgs(process.argv.slice(2));
 const config = safeReadJson(CONFIG_FILE) || {};
 const port = opts.port || config.dashboard_port || 4747;
-
-function pidAlive(pid) {
-  if (!pid) return false;
-  try { process.kill(pid, 0); return true; } catch { return false; }
-}
-
-// Guard against pid reuse: only ever kill a pid that still looks like a Node
-// process. If we cannot tell, refuse — a wrong kill is worse than a stale run.
-function pidLooksLikeNode(pid) {
-  try {
-    if (process.platform === 'win32') {
-      const r = spawnSync('tasklist', ['/fi', `pid eq ${pid}`, '/fo', 'csv', '/nh'], { encoding: 'utf8', windowsHide: true });
-      return /node/i.test(r.stdout || '');
-    }
-    const r = spawnSync('ps', ['-p', String(pid), '-o', 'comm='], { encoding: 'utf8' });
-    return /node/i.test(r.stdout || '');
-  } catch {
-    return false;
-  }
-}
 
 function listRuns() {
   let entries = [];
@@ -125,7 +108,8 @@ function readBody(req) {
     let data = '';
     req.on('data', (chunk) => {
       data += chunk;
-      if (data.length > 64 * 1024) { reject(new Error('body too large')); req.destroy(); }
+      // Prompt files can be large; 4 MB is far beyond any sane import.
+      if (data.length > 4 * 1024 * 1024) { reject(new Error('body too large')); req.destroy(); }
     });
     req.on('end', () => {
       if (!data) return resolve({});
@@ -137,20 +121,36 @@ function readBody(req) {
 
 // The last runner this dashboard spawned. state.json only reports a run once
 // the runner has booted far enough to write it, so this in-memory pid closes
-// the double-start window in between.
+// the double-start window in between. It is cleared by the child's own exit
+// event; the pidLooksLikeNode check is the backstop against OS pid reuse.
 let spawnedRunnerPid = null;
 
 function runnerIsActive() {
-  if (spawnedRunnerPid && pidAlive(spawnedRunnerPid)) return true;
+  if (spawnedRunnerPid) {
+    if (pidAlive(spawnedRunnerPid) && pidLooksLikeNode(spawnedRunnerPid)) return true;
+    spawnedRunnerPid = null; // dead or recycled — self-heal
+  }
+  // A runner started outside the dashboard holds .runner.lock from before its
+  // first state.json write — honor it for its whole lifetime.
+  try {
+    const lockPid = parseInt(fs.readFileSync(path.join(DATA_ROOT, '.runner.lock'), 'utf8'), 10);
+    if (lockPid && pidAlive(lockPid) && pidLooksLikeNode(lockPid)) return true;
+  } catch { /* no lock */ }
   const state = readState(STATE_FILE);
-  return Boolean(state && state.status === 'running' && pidAlive(state.pid));
+  return Boolean(state && state.status === 'running' && pidAlive(state.pid) && pidLooksLikeNode(state.pid));
 }
 
 function startRunner({ retryStuck = false } = {}) {
   if (runnerIsActive()) return { ok: false, error: 'A run is already in progress.' };
   try { fs.rmSync(STOP_FILE, { force: true }); } catch { /* ignore */ }
   fs.mkdirSync(LOGS_DIR, { recursive: true });
-  const args = [path.join(ROOT, 'runner.js')];
+  const args = [
+    path.join(ROOT, 'runner.js'),
+    '--queue', QUEUE_FILE,
+    '--config', CONFIG_FILE,
+    '--logs', LOGS_DIR,
+    '--state', STATE_FILE,
+  ];
   if (retryStuck) args.push('--retry-stuck');
   // Early crashes (bad config/queue) happen before the runner opens its own
   // log file — capture the console in a spawn log so nothing is ever silent.
@@ -165,6 +165,10 @@ function startRunner({ retryStuck = false } = {}) {
     });
     child.unref();
     spawnedRunnerPid = child.pid;
+    // unref() detaches the event loop, not the 'exit' event — release the
+    // in-memory latch the moment the runner actually ends, so a reused OS pid
+    // can never wedge the dashboard in "running".
+    child.on('exit', () => { if (spawnedRunnerPid === child.pid) spawnedRunnerPid = null; });
     return { ok: true, pid: child.pid };
   } finally {
     fs.closeSync(out);
@@ -211,6 +215,72 @@ const routes = {
     json(res, 200, { size: stat.size, offset: offset + consumed, data });
   },
 
+  // Parse a markdown/txt prompt file into an ordered prompt list — preview
+  // only, nothing is saved until /api/prompts/save.
+  'POST /api/prompts/import': async (req, res) => {
+    const body = await readBody(req);
+    try {
+      const parsed = parsePrompts(String(body.content ?? ''));
+      json(res, 200, { ok: true, ...parsed });
+    } catch (err) {
+      json(res, 400, { ok: false, error: String(err.message || err) });
+    }
+  },
+
+  // Persist the reviewed prompt list as the active queue.
+  'POST /api/prompts/save': async (req, res) => {
+    const body = await readBody(req);
+    if (runnerIsActive()) {
+      return json(res, 409, { ok: false, error: 'A run is in progress — stop it before replacing the queue.' });
+    }
+    const prompts = Array.isArray(body.prompts) ? body.prompts : [];
+    const cleaned = prompts
+      .map((p) => ({ title: String(p?.title ?? '').trim(), prompt: String(p?.prompt ?? '').trim() }))
+      .filter((p) => p.prompt);
+    if (!cleaned.length) return json(res, 400, { ok: false, error: 'No prompts to save.' });
+
+    const projectName = String(body.project_name ?? '').trim() || 'my-site';
+    const slug = slugify(projectName, 'my-site');
+    const queue = {
+      project_name: projectName,
+      project_path: `./projects/${slug}`,
+      context: String(body.context ?? '').trim(),
+      deploy: {
+        enabled: body.deploy?.enabled !== false,
+        repo_name: String(body.deploy?.repo_name ?? '').trim() || slug,
+      },
+      phases: cleaned.map((p, i) => ({
+        id: `prompt-${i + 1}`,
+        title: p.title || `Prompt ${i + 1}`,
+        prompt: p.prompt,
+        status: 'pending',
+        retries: 0,
+        commit_hash: null,
+      })),
+    };
+    fs.mkdirSync(path.dirname(QUEUE_FILE), { recursive: true });
+    atomicWriteJson(QUEUE_FILE, queue);
+    // The previous run's state.json would otherwise keep painting the Live tab
+    // with the OLD run's phases. No run is active (guarded above) — clear it;
+    // run history stays available through the logs.
+    try { fs.rmSync(STATE_FILE, { force: true }); } catch { /* OneDrive lock — ignore */ }
+    json(res, 200, { ok: true, queue });
+  },
+
+  'GET /api/queue': (req, res) => {
+    json(res, 200, { queue: safeReadJson(QUEUE_FILE) });
+  },
+
+  // Whole log file as plain text (for "open raw log" in the Logs tab).
+  'GET /api/raw': (req, res, url) => {
+    const abs = resolveLogFile(url.searchParams.get('file'));
+    if (!abs) return json(res, 400, { error: 'invalid file' });
+    let data;
+    try { data = fs.readFileSync(abs); } catch { return json(res, 404, { error: 'not found' }); }
+    res.writeHead(200, { 'Content-Type': 'text/plain; charset=utf-8', 'Cache-Control': 'no-store' });
+    res.end(data);
+  },
+
   'POST /api/run/start': async (req, res) => {
     const body = await readBody(req);
     const result = startRunner({ retryStuck: Boolean(body.retryStuck) });
@@ -231,8 +301,12 @@ const routes = {
       if (!pidLooksLikeNode(state.pid)) {
         return json(res, 409, { ok: false, error: `pid ${state.pid} no longer looks like the runner (pid reuse?) — not killing it. The stop flag is set.` });
       }
-      // Take the recorded in-flight Claude call down first, then the runner.
-      if (state.claude_pid && pidAlive(state.claude_pid)) {
+      // On Windows the agent session is a non-detached child of the runner, so
+      // taskkill /T on the runner takes the whole tree down — no need to touch
+      // claude_pid, which could have been recycled by an unrelated process.
+      // On POSIX the agent runs detached in its own process group and must be
+      // killed separately (killTree uses the group kill there).
+      if (process.platform !== 'win32' && state.claude_pid && pidAlive(state.claude_pid)) {
         killTree(state.claude_pid);
         killed.push(state.claude_pid);
       }
@@ -240,6 +314,9 @@ const routes = {
       killed.push(state.pid);
       writeState(STATE_FILE, { ...state, status: 'stopped', message: 'Killed from the dashboard.', claude_pid: null });
     }
+    // A force-killed runner never runs its exit handler — release its lock on
+    // its behalf so the next Start doesn't have to steal it.
+    try { fs.rmSync(path.join(DATA_ROOT, '.runner.lock'), { force: true }); } catch { /* ignore */ }
     spawnedRunnerPid = null;
     json(res, 200, killed.length
       ? { ok: true, killed }

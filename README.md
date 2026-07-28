@@ -1,181 +1,138 @@
 # Prompt Chain Runner
 
-An autonomous prompt-chain orchestrator for [Claude Code](https://claude.com/claude-code).
+An autonomous **agent company** that builds, tests, and ships a whole project from a single prompt file — driven by [Claude Code](https://claude.com/claude-code), watched from a live dashboard, with **zero human input between Start and "your site is live."**
 
-You write an ordered list of build prompts ("phases") once. The runner then drives Claude Code through them completely unattended:
+You import a markdown/txt file of ordered prompts. Then the company takes over:
 
-1. Sends the next unfinished phase to Claude Code programmatically — no typing, no approval clicks.
-2. When Claude Code finishes, runs **real verification commands** (install, typecheck, lint, build, test) against the actual project and reads the real exit codes. "Claude said it's done" counts for nothing.
-3. Verification passed → commits to git, marks the phase `passed`, moves on.
-4. Verification failed → auto-builds a fix prompt from the **exact error output** and sends it back to Claude Code. Retries up to `max_retries`.
-5. Retries exhausted → marks the phase `stuck` and **halts the whole run** (later phases likely depend on the broken one). Everything is in the log.
-6. Repeats until every phase is done.
+| Agent | Job |
+|---|---|
+| **Orchestrator** (`runner.js`) | The main agent. Injects prompts in order, routes every hand-off, verifies everything, commits every passing step, halts on real trouble. Deterministic code — it never hallucinates. |
+| **Builder** | A headless Claude Code session per prompt. Does the work, then files a machine-readable report (`.pcr/report.json`). |
+| **Tester** | A *separate* Claude Code session. Reads the builder's claims and verifies them skeptically — runs the app, clicks through, checks output — then files a verdict (`.pcr/verdict.json`). Failures go straight back to the builder as fix prompts with the exact evidence. |
+| **Deployer** | When every prompt has passed: creates the GitHub repo, pushes, sets up GitHub Pages, and reports the public URL. The orchestrator then **polls that URL itself** — the site is "live" only when the orchestrator has seen it serve HTTP 200. |
 
-A live **web dashboard** shows the entire run as it happens: every phase, every Claude call, every verification step, every fix prompt, every commit — plus start/stop/kill controls.
+On top of the agents, **auto-detected checks** (npm install / typecheck / lint / build / test — derived from what the project actually is, nothing to configure) run after every builder attempt. Exit codes never hallucinate.
 
-The only human touchpoints: writing the phase list before the run, and reading the log if something gets stuck.
+You get exactly one Windows notification: when the site is fully built, tested, and live on GitHub. (And one if the run halts and genuinely needs you.)
 
-**Zero dependencies.** No database, no workflow engine, no accounts. Node's standard library only — `npm install` is not even needed for the runner itself.
+**Zero dependencies.** Node's standard library only.
 
 ---
 
 ## Quick start
 
 ```bash
-# 1. Describe what "verified" means for your project
-#    (edit the verification_steps in config.json)
-
-# 2. Write your phases, in order, fully, in advance
-#    (edit prompts/queue.json)
-
-# 3. Start the dashboard (opens the browser)
-npm run dashboard        # or: node dashboard.js --open
-
-# 4. Click "Start run" — or run headless:
-node runner.js
+npm run dashboard        # or: node dashboard.js --open  →  http://127.0.0.1:4747
 ```
 
-Requirements: Node.js 20+, git, and the Claude Code CLI installed and logged in (`claude` on your PATH). The runner rides on your existing Claude Code session — no API key needed.
+1. **Prompts tab** — drop in your `.md`/`.txt` prompt file (or paste it). It is split into ordered prompts automatically: by markdown headings, `---` separators, or `Prompt 1 / 2 / 3` numbering. Text above the first prompt becomes shared project context sent with every build step.
+2. Review the parsed queue (edit/reorder/remove if you like), name the project, leave *Deploy to GitHub Pages* on.
+3. Click **Save & start the run** — and walk away.
+4. **Live tab** — watch the company work: which agent is on duty, the pipeline of prompts, and the agent-to-agent feed (builder reports, tester verdicts, fix prompts, commits, deploy).
+5. **Logs tab** — every run, filterable per prompt: full prompts, full outputs, every check, every verdict, every fix.
+
+Requirements: Node.js 20+, git, the Claude Code CLI logged in (`claude` on PATH), and the GitHub CLI (`gh`) authenticated if you want deploys. No API key — it rides your existing Claude Code session.
+
+### Example prompt file
+
+```markdown
+This is a one-page portfolio site for a photographer. Dark, minimal, fast.
+
+## Prompt 1 — scaffold
+Create a static site: index.html, styles.css, script.js. Semantic HTML, no frameworks.
+
+## Prompt 2 — gallery
+Build a responsive photo gallery with a lightbox. Use placeholder images.
+
+## Prompt 3 — polish
+Add smooth scrolling, meta/OG tags, favicon, and a contact section.
+```
+
+(`prompts/example-prompts.md` in this repo is a ready-to-import sample.)
 
 ---
 
-## The phase queue — `prompts/queue.json`
+## How a single prompt flows
 
-This is the only input you write by hand:
-
-```json
-{
-  "project_path": "./target-project",
-  "phases": [
-    {
-      "id": "phase-1",
-      "prompt": "Set up a Next.js project with TypeScript and Tailwind. Create the folder structure for pages, components, and lib.",
-      "status": "pending",
-      "retries": 0,
-      "commit_hash": null
-    },
-    {
-      "id": "phase-2",
-      "prompt": "Build the landing page UI. Use the components folder created in phase-1.",
-      "status": "pending",
-      "retries": 0,
-      "commit_hash": null
-    }
-  ]
-}
+```
+Orchestrator ──prompt──► Builder (Claude Code, headless)
+     ▲                      │ works, writes .pcr/report.json
+     │                      ▼
+     │        auto-detected checks (real commands, real exit codes)
+     │                      │ all exit 0
+     │                      ▼
+     │                   Tester (separate Claude Code session)
+     │                      │ verifies the claims, writes .pcr/verdict.json
+     │   FAIL: fix prompt   │
+     └──── with evidence ◄──┤ PASS
+                            ▼
+                git commit → next prompt … → Deployer → GitHub Pages
+                                                  │
+                            orchestrator polls the public URL itself
+                                                  ▼
+                            🔔 Windows toast: "your site is LIVE" + URL
 ```
 
-- `project_path` — where Claude Code works. A relative path resolves against this repo's root. The runner creates the folder and initializes a git repo in it if needed.
-- Phases run strictly in order. The runner never skips ahead and never reorders.
-- `status` is owned by the runner: `pending` → `running` → `passed` / `failed_retry` / `stuck`. The file is rewritten after every step, so you can watch it, and a crashed run resumes exactly where it left off — `passed` phases are skipped, a phase caught mid-`running` is re-run.
-- `commit_hash` records exactly which commit each phase produced — a full audit trail.
+- Every failure (failed check *or* tester rejection) becomes a fix prompt containing the exact error output / evidence, sent back to the builder. Bounded by `max_retries`.
+- Retries exhausted → the phase is `stuck` and the run **halts** (exit 2) instead of building on sand — and you get notified.
+- Fully resumable: rerun and `passed` phases are skipped; a phase caught mid-run is redone.
+- One commit per passed phase in the target project's own git repo — a full audit trail.
+- Agent files live in `<project>/.pcr/` (gitignored) and are **deleted by the orchestrator before each agent call**, so a stale or forged report/verdict can never be reused.
 
 ## Settings — `config.json`
 
-```json
-{
-  "claude_command": "claude",
-  "claude_args": [],
-  "claude_timeout_ms": 3600000,
-  "max_retries": 4,
-  "stop_on_first_failure": false,
-  "output_capture_limit": 20000,
-  "fix_prompt_output_limit": 8000,
-  "verify_timeout_ms": 600000,
-  "dashboard_port": 4747,
-  "verification_steps": [
-    { "name": "install",   "command": "npm install" },
-    { "name": "typecheck", "command": "npx tsc --noEmit" },
-    { "name": "lint",      "command": "npm run lint" },
-    { "name": "build",     "command": "npm run build" },
-    { "name": "test",      "command": "npm test -- --run" }
-  ]
-}
-```
+Verification is automatic; there is nothing you must edit here.
 
 | Key | Meaning |
 |---|---|
-| `claude_command` | The CLI to drive. A string, or an array like `["node", "path/to/cli.js"]` (the test suite uses this to swap in a mock). |
-| `claude_args` | Extra flags appended to every Claude Code call (e.g. `["--model", "opus"]`). |
-| `claude_timeout_ms` | Hard kill for a single Claude Code call. Default 1 hour. |
-| `max_retries` | Fix-prompt retries per phase before it's declared `stuck`. |
-| `verification_steps` | The gate. Every command must exit 0, in your project, for a phase to pass. Per-step `timeout_ms` optional. |
-| `stop_on_first_failure` | `false` (default) runs all steps and puts **every** failure into the fix prompt; `true` stops at the first. |
-| `output_capture_limit` | Max chars of a step's output kept in logs/events. |
-| `fix_prompt_output_limit` | Max chars of a step's output embedded in a fix prompt (tail-kept — errors live at the end). |
+| `claude_command`, `claude_args` | The CLI to drive (array form supported; tests use it to swap in a mock). |
+| `claude_timeout_ms` / `tester_timeout_ms` | Hard kill per builder / tester call (1 h / 20 min default). |
+| `max_retries` | Fix rounds per prompt (and per deploy) before `stuck`. |
+| `tester.enabled` | Turn the tester agent off (checks-only gating). Default on. |
+| `deploy.enabled` | Deploy stage on/off. Default on (the dashboard toggle overrides per project). |
+| `deploy.visibility` | GitHub repo visibility (`public` default — Pages on the free plan needs public). |
+| `deploy.verify_live`, `deploy.live_timeout_ms` | The orchestrator's own URL polling. |
+| `notify.enabled` | Windows toast (with `msg` fallback) on finish/halt. |
+| `verification_steps` | Optional manual override; when absent (default) checks are auto-detected per attempt. |
 
-## The dashboard
+## The three tabs
 
-```bash
-node dashboard.js --open     # default http://127.0.0.1:4747
-```
+- **Live** — status pill + Start/Stop/Kill; stat tiles (project, progress, elapsed, cost); the four agent cards with live activity; the prompt pipeline with per-prompt status and retry counts (plus the 🚀 deploy chip); the agent feed; a big green banner with the live URL when done.
+- **Prompts** — file drop / paste → parsed preview (editable, reorderable) → project name, deploy toggle, repo name → Save / Save & start.
+- **Logs** — run selector, per-prompt filter chips, expandable full detail for every event, raw log download.
 
-- **Stat tiles** — phases passed (with progress meter), current phase and attempt, Claude calls and total time in Claude, cost reported by Claude Code, elapsed.
-- **Phase pipeline** — every phase with its live status chip, retry count, commit hash, full prompt, and per-step verification results with error output.
-- **Activity feed** — the structured event stream: prompts sent, Claude results, each verification step passing/failing, auto-generated fix prompts (viewable in full), commits, stuck/done.
-- **Raw log** — the actual transcript file, live-tailing, including past runs via the run selector.
-- **Controls** — Start run (optionally reviving stuck phases), Stop (graceful: finishes the current step, then halts), Kill (force-kills the process tree).
-
-The dashboard binds to `127.0.0.1` only. It is a local control panel — don't expose it.
+The dashboard binds to `127.0.0.1` only and rejects foreign `Host`/`Origin` headers (DNS-rebinding/CSRF protection). It is a local control panel — never expose it.
 
 Headless equivalents:
 
 ```bash
 node runner.js                  # start a run
-node runner.js --retry-stuck    # also revive phases marked stuck
-node runner.js --dry-run        # validate queue + config, print the plan, execute nothing
-# graceful stop from another terminal: create a file named .stop next to state.json
+node runner.js --retry-stuck    # revive stuck phases
+node runner.js --dry-run        # validate + print the plan, execute nothing
+# graceful stop: create a file named .stop next to state.json
 ```
 
-## How the pieces fit
-
-```
-┌────────────┐   phase prompt    ┌─────────────┐
-│ runner.js  │ ────────────────► │ Claude Code │  (claude -p, stdin prompt,
-│ (the loop) │ ◄──────────────── │  headless   │   --output-format json,
-└─────┬──────┘   JSON result     └─────────────┘   --dangerously-skip-permissions)
-      │
-      │ real commands, real exit codes
-      ▼
-┌─────────────────────────────┐  all pass → git commit, next phase
-│ verification gate           │
-│ install → typecheck → lint  │  any fail → fix prompt from exact errors,
-│ → build → test              │             same phase again (≤ max_retries)
-└─────────────────────────────┘
-      │
-      ▼
- queue.json (statuses, commit hashes)   state.json (live run state)
- logs/run-*.log (full transcript)       logs/run-*.events.jsonl (event stream)
-      ▲                                       ▲
-      └────────────── dashboard.js ───────────┘  → http://127.0.0.1:4747
-```
-
-Files:
+## Files
 
 ```
 prompt-chain-runner/
-├── runner.js            # the orchestrator — one while loop, no magic
-├── dashboard.js         # zero-dep local web server + runner controls
-├── public/index.html    # the dashboard UI (single self-contained file)
-├── config.json          # verification gate + settings
-├── prompts/queue.json   # your phases (the only hand-written input)
-├── lib/                 # claude, verify, git, queue, state, logger, fix-prompt, util
-├── logs/                # run-<stamp>.log + run-<stamp>.events.jsonl per run
-├── state.json           # live state for the dashboard (generated)
-└── target-project/      # the codebase Claude Code builds (its own git repo)
+├── runner.js               # the Orchestrator
+├── dashboard.js            # zero-dep local web server + API
+├── public/index.html       # the dashboard (single self-contained file)
+├── config.json             # settings (verification is auto-detected)
+├── prompts/queue.json      # the active queue (written by the dashboard)
+├── prompts/example-prompts.md
+├── lib/
+│   ├── agents.js           # Builder / Tester / Deployer roles + .pcr protocol
+│   ├── autocheck.js        # auto-detected verification steps
+│   ├── parse-prompts.js    # md/txt → ordered prompt queue
+│   ├── live-check.js       # the orchestrator's own "is it live" polling
+│   ├── notify.js           # Windows toast / msg fallback
+│   └── claude, verify, git, queue, state, logger, fix-prompt, util
+├── logs/                   # run-<stamp>.log + run-<stamp>.events.jsonl
+├── state.json              # live state for the dashboard (generated)
+└── projects/<slug>/        # each built site (its own git repo, own GitHub remote)
 ```
-
-## When a phase gets stuck
-
-The run halts (exit code 2) instead of silently skipping ahead. To diagnose:
-
-1. Open the dashboard → the stuck phase shows its failed steps and error output; or read `logs/run-<stamp>.log` — every prompt, every Claude result, every command output is in there.
-2. Fix the cause: sharpen the phase prompt, fix the environment, or hand-fix the code in `target-project` and commit.
-3. Resume with `node runner.js --retry-stuck` (or tick *retry stuck* in the dashboard). Passed phases are never re-run.
-
-Exit codes: `0` all phases passed · `1` runner error (including refusing to start because another runner already holds `.runner.lock`) · `2` stuck · `3` stopped.
-
-Only one runner can be active per queue: the runner takes an exclusive `.runner.lock` (next to `state.json`) at startup and releases it on every exit path. A lock left behind by a crashed process is detected (dead pid) and stolen automatically.
 
 ## Tests
 
@@ -183,14 +140,14 @@ Only one runner can be active per queue: the runner takes an exclusive `.runner.
 npm test
 ```
 
-The suite swaps the Claude CLI for a scripted mock (`test/mock-claude.js`) but keeps everything else real — real child processes, real shell verification commands, real git commits. It covers: the happy path, fix-prompt generation from real error output, multi-step failure aggregation, retry exhaustion → stuck → halt, CLI-crash retries, resume + `--retry-stuck`, graceful stop, output truncation, and queue validation.
+27 end-to-end + unit tests. The Claude CLI is swapped for a scripted mock; everything else is real — real processes, real shell checks, real git commits, real HTTP for the dashboard API and the live check. Covered: the happy path, fix prompts from real errors, tester verdict flow (including a missing verdict and a builder-forged verdict), retry exhaustion → stuck, CLI crashes, resume, graceful stop, deploy (trust + independent live rejection), the parser, auto-check detection, and the dashboard API with its security guards.
 
 ## Safety notes, honestly
 
-- The runner passes `--dangerously-skip-permissions` to Claude Code. That is the flag that makes a fully unattended run possible — and it means Claude Code edits files and runs commands in `target-project` **without asking**. Point `project_path` only at a directory you're happy to have rewritten wholesale, and treat the verification gate + git history as your safety net.
-- Auto-commits in the target repo are made with signing disabled (`commit.gpgsign false`, repo-local) so an unattended run can never hang on a GPG prompt.
-- The dashboard has no authentication; it listens on localhost only, and rejects requests whose `Host`/`Origin` headers are not local (DNS-rebinding/CSRF protection). Anyone with local access to the machine can still control the runner through it.
-- Stop is graceful (the runner halts after the current Claude call or verification step); Kill force-kills the runner's process tree including the in-flight Claude Code call — on Windows via `taskkill /T`, on macOS/Linux via process-group kills.
+- Builder/tester/deployer sessions run with `--dangerously-skip-permissions` — that's what makes a fully unattended run possible. Point projects only at directories you're happy to have rewritten, and treat the checks + tester + git history as the safety net.
+- The deployer uses your authenticated `gh` CLI and creates **public** repos by default (Pages requirement on free plans). Set `deploy.visibility` or turn deploys off per project if that's not what you want.
+- Auto-commits are unsigned (repo-local `commit.gpgsign false`) so a run can never hang on a GPG prompt.
+- Only one runner per queue (`.runner.lock`, dead-pid steal). Stop is graceful; Kill takes down the whole process tree including the in-flight Claude call.
 
 ## License
 

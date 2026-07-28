@@ -3,661 +3,750 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Prompt Chain Runner</title>
+<title>Prompt Chain Runner — Mission Control</title>
 <style>
   :root {
-    color-scheme: light;
-    --page: #f9f9f7;
-    --surface: #fcfcfb;
-    --ink: #0b0b0b;
-    --ink-2: #52514e;
-    --muted: #898781;
-    --grid: #e1e0d9;
-    --border: rgba(11, 11, 11, 0.10);
-    --accent: #2a78d6;
-    --good: #0ca30c;
-    --good-text: #006300;
-    --warning: #fab219;
-    --serious: #ec835a;
-    --critical: #d03b3b;
-    --chip-good-bg: rgba(12, 163, 12, 0.10);
-    --chip-warn-bg: rgba(250, 178, 25, 0.14);
-    --chip-crit-bg: rgba(208, 59, 59, 0.10);
-    --chip-run-bg: rgba(42, 120, 214, 0.10);
-    --chip-idle-bg: rgba(11, 11, 11, 0.05);
-    --mono: ui-monospace, "Cascadia Code", Consolas, Menlo, monospace;
-  }
-  :root[data-theme="dark"] {
     color-scheme: dark;
     --page: #0d0d0d;
     --surface: #1a1a19;
+    --surface-2: #222221;
     --ink: #ffffff;
     --ink-2: #c3c2b7;
     --muted: #898781;
-    --grid: #2c2c2a;
-    --border: rgba(255, 255, 255, 0.10);
+    --hairline: #2c2c2a;
+    --border: rgba(255,255,255,0.10);
+    --good: #0ca30c;
+    --warning: #fab219;
+    --serious: #ec835a;
+    --critical: #d03b3b;
     --accent: #3987e5;
-    --good-text: #0ca30c;
-    --chip-good-bg: rgba(12, 163, 12, 0.16);
-    --chip-warn-bg: rgba(250, 178, 25, 0.14);
-    --chip-crit-bg: rgba(208, 59, 59, 0.18);
-    --chip-run-bg: rgba(57, 135, 229, 0.16);
-    --chip-idle-bg: rgba(255, 255, 255, 0.06);
+    --accent-2: #256abf;
   }
-  @media (prefers-color-scheme: dark) {
-    :root:not([data-theme="light"]) {
-      color-scheme: dark;
-      --page: #0d0d0d;
-      --surface: #1a1a19;
-      --ink: #ffffff;
-      --ink-2: #c3c2b7;
-      --muted: #898781;
-      --grid: #2c2c2a;
-      --border: rgba(255, 255, 255, 0.10);
-      --accent: #3987e5;
-      --good-text: #0ca30c;
-      --chip-good-bg: rgba(12, 163, 12, 0.16);
-      --chip-warn-bg: rgba(250, 178, 25, 0.14);
-      --chip-crit-bg: rgba(208, 59, 59, 0.18);
-      --chip-run-bg: rgba(57, 135, 229, 0.16);
-      --chip-idle-bg: rgba(255, 255, 255, 0.06);
-    }
-  }
-
   * { box-sizing: border-box; }
+  html, body { margin: 0; padding: 0; }
   body {
-    margin: 0;
     background: var(--page);
     color: var(--ink);
     font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
   }
   a { color: var(--accent); }
 
+  /* ---------- header ---------- */
   header {
-    display: flex; flex-wrap: wrap; align-items: center; gap: 12px;
-    padding: 14px 20px;
+    display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--hairline);
     background: var(--surface);
-    border-bottom: 1px solid var(--grid);
-    position: sticky; top: 0; z-index: 5;
+    position: sticky; top: 0; z-index: 10;
   }
-  header h1 { font-size: 16px; margin: 0; font-weight: 650; letter-spacing: 0.01em; }
-  header .sub { color: var(--muted); font-size: 12px; }
-  .spacer { flex: 1; }
-
+  .brand { font-weight: 700; font-size: 15px; letter-spacing: .2px; }
+  .brand small { color: var(--muted); font-weight: 400; margin-left: 8px; }
   .pill {
     display: inline-flex; align-items: center; gap: 6px;
-    padding: 3px 10px; border-radius: 999px;
-    font-size: 12px; font-weight: 600;
-    border: 1px solid var(--border);
-    background: var(--chip-idle-bg); color: var(--ink-2);
+    padding: 3px 10px; border-radius: 999px; font-size: 12px; font-weight: 600;
+    border: 1px solid var(--border); color: var(--ink-2); background: var(--surface-2);
   }
-  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
-  .pill.running { background: var(--chip-run-bg); color: var(--ink); }
-  .pill.running .dot { background: var(--accent); animation: pulse 1.2s ease-in-out infinite; }
-  .pill.passed_all { background: var(--chip-good-bg); color: var(--good-text); }
+  .pill .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); }
+  .pill.running .dot { background: var(--accent); animation: pulse 1.2s infinite; }
   .pill.passed_all .dot { background: var(--good); }
-  .pill.stuck, .pill.error { background: var(--chip-crit-bg); color: var(--critical); }
   .pill.stuck .dot, .pill.error .dot { background: var(--critical); }
-  .pill.stopped .dot { background: var(--serious); }
-  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .pill.stopped .dot { background: var(--warning); }
+  @keyframes pulse { 50% { opacity: .3; } }
 
-  button {
-    font: inherit; font-size: 13px; font-weight: 600;
-    padding: 6px 14px; border-radius: 8px; cursor: pointer;
-    border: 1px solid var(--border);
-    background: var(--surface); color: var(--ink);
+  nav { display: flex; gap: 4px; margin-left: auto; }
+  nav button {
+    background: none; border: 1px solid transparent; color: var(--ink-2);
+    padding: 6px 14px; border-radius: 8px; font: inherit; font-weight: 600; cursor: pointer;
   }
-  button:hover { border-color: var(--muted); }
-  button:disabled { opacity: 0.45; cursor: not-allowed; }
-  button.primary { background: var(--accent); border-color: transparent; color: #fff; }
-  button.danger { color: var(--critical); }
-  label.opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12px; color: var(--ink-2); user-select: none; }
+  nav button.active { background: var(--surface-2); border-color: var(--border); color: var(--ink); }
+  nav button:hover { color: var(--ink); }
 
-  main { padding: 18px 20px 40px; max-width: 1500px; margin: 0 auto; }
-
-  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 18px; }
-  .tile {
-    background: var(--surface); border: 1px solid var(--border);
-    border-radius: 12px; padding: 12px 16px;
+  .actions { display: flex; gap: 8px; }
+  .btn {
+    font: inherit; font-weight: 600; cursor: pointer;
+    padding: 6px 14px; border-radius: 8px;
+    border: 1px solid var(--border); background: var(--surface-2); color: var(--ink);
   }
-  .tile .label { font-size: 11px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); }
-  .tile .value { font-size: 26px; font-weight: 650; margin-top: 2px; }
-  .tile .value small { font-size: 14px; font-weight: 500; color: var(--ink-2); }
-  .tile .hint { font-size: 12px; color: var(--ink-2); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .meter { height: 4px; border-radius: 4px; background: var(--grid); margin-top: 10px; overflow: hidden; }
-  .meter > div { height: 100%; border-radius: 4px; background: var(--good); transition: width 0.4s ease; }
+  .btn:hover { border-color: var(--muted); }
+  .btn.primary { background: var(--accent-2); border-color: var(--accent-2); }
+  .btn.primary:hover { background: var(--accent); }
+  .btn.danger { color: #ff9c9c; }
+  .btn:disabled { opacity: .4; cursor: not-allowed; }
 
-  .cols { display: grid; grid-template-columns: minmax(340px, 5fr) minmax(380px, 7fr); gap: 16px; align-items: start; }
-  @media (max-width: 980px) { .cols { grid-template-columns: 1fr; } }
+  main { max-width: 1200px; margin: 0 auto; padding: 20px; }
+  .tab { display: none; }
+  .tab.visible { display: block; }
 
-  .panel { background: var(--surface); border: 1px solid var(--border); border-radius: 12px; overflow: hidden; }
-  .panel > .head {
-    display: flex; align-items: center; gap: 10px;
-    padding: 10px 14px; border-bottom: 1px solid var(--grid);
-    font-weight: 650; font-size: 13px;
+  .card {
+    background: var(--surface); border: 1px solid var(--hairline);
+    border-radius: 12px; padding: 16px; margin-bottom: 16px;
   }
-  .panel > .head .count { color: var(--muted); font-weight: 500; }
+  .card h2 { margin: 0 0 12px; font-size: 13px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); font-weight: 700; }
 
-  .phase {
-    border-bottom: 1px solid var(--grid); padding: 10px 14px;
-  }
-  .phase:last-child { border-bottom: 0; }
-  .phase .row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
-  .phase .num { color: var(--muted); font-size: 12px; width: 2.2em; flex: none; font-variant-numeric: tabular-nums; }
-  .phase .id { font-weight: 650; }
-  .phase .meta { color: var(--muted); font-size: 12px; margin-left: auto; display: flex; gap: 10px; align-items: center; }
-  .phase .hash { font-family: var(--mono); font-size: 11px; color: var(--ink-2); background: var(--chip-idle-bg); border-radius: 6px; padding: 1px 6px; }
+  /* ---------- stat tiles ---------- */
+  .tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(150px, 1fr)); gap: 12px; margin-bottom: 16px; }
+  .tile { background: var(--surface); border: 1px solid var(--hairline); border-radius: 12px; padding: 12px 16px; }
+  .tile .k { font-size: 11px; text-transform: uppercase; letter-spacing: .8px; color: var(--muted); font-weight: 700; }
+  .tile .v { font-size: 24px; font-weight: 700; margin-top: 2px; }
+  .tile .s { font-size: 12px; color: var(--ink-2); }
 
+  /* ---------- banner ---------- */
+  .banner { border-radius: 12px; padding: 16px 20px; margin-bottom: 16px; font-weight: 600; display: none; border: 1px solid; }
+  .banner.show { display: block; }
+  .banner.live { background: rgba(12,163,12,.12); border-color: var(--good); }
+  .banner.dead { background: rgba(208,59,59,.12); border-color: var(--critical); }
+  .banner a { font-weight: 700; }
+  .banner .big { font-size: 18px; }
+
+  /* ---------- agents ---------- */
+  .agents { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 12px; }
+  .agent { background: var(--surface-2); border: 1px solid var(--hairline); border-radius: 10px; padding: 12px; }
+  .agent .name { font-weight: 700; display: flex; align-items: center; gap: 8px; }
+  .agent .role { color: var(--muted); font-size: 12px; }
+  .agent .doing { margin-top: 8px; font-size: 12px; color: var(--ink-2); min-height: 18px; overflow-wrap: anywhere; }
+  .agent .dot { width: 9px; height: 9px; border-radius: 50%; background: var(--hairline); flex: none; }
+  .agent.active { border-color: var(--accent); }
+  .agent.active .dot { background: var(--accent); animation: pulse 1.2s infinite; }
+
+  /* ---------- pipeline ---------- */
+  .pipeline { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
   .chip {
-    display: inline-flex; align-items: center; gap: 5px;
-    font-size: 11px; font-weight: 650; letter-spacing: 0.02em;
-    padding: 2px 9px; border-radius: 999px; border: 1px solid var(--border);
-    background: var(--chip-idle-bg); color: var(--ink-2); flex: none;
+    display: inline-flex; align-items: center; gap: 7px;
+    border: 1px solid var(--hairline); border-radius: 999px;
+    padding: 5px 12px; font-size: 12px; font-weight: 600; color: var(--ink-2);
+    background: var(--surface-2); max-width: 260px;
   }
-  .chip.passed { background: var(--chip-good-bg); color: var(--good-text); }
-  .chip.running { background: var(--chip-run-bg); color: var(--ink); }
-  .chip.failed_retry { background: var(--chip-warn-bg); color: var(--ink); }
-  .chip.stuck { background: var(--chip-crit-bg); color: var(--critical); }
+  .chip .txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .chip .st { font-weight: 700; }
+  .chip .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--muted); flex: none; }
+  .chip.running { border-color: var(--accent); color: var(--ink); }
+  .chip.running .dot { background: var(--accent); animation: pulse 1.2s infinite; }
+  .chip.passed .dot, .chip.live .dot { background: var(--good); }
+  .chip.failed_retry .dot, .chip.deploying .dot { background: var(--warning); }
+  .chip.stuck .dot, .chip.failed .dot { background: var(--critical); }
+  .chip .n { color: var(--muted); font-weight: 400; }
+  .arrow { color: var(--muted); }
 
-  details.prompt { margin-top: 6px; }
-  details.prompt summary, details.vout summary {
-    cursor: pointer; font-size: 12px; color: var(--ink-2); user-select: none;
+  /* ---------- feed ---------- */
+  .feed { max-height: 420px; overflow-y: auto; display: flex; flex-direction: column; gap: 6px; }
+  .msg { display: flex; gap: 10px; padding: 8px 10px; border-radius: 8px; background: var(--surface-2); border: 1px solid transparent; }
+  .msg time { color: var(--muted); font-size: 11px; flex: none; padding-top: 2px; font-variant-numeric: tabular-nums; }
+  .msg .who { font-weight: 700; font-size: 12px; flex: none; }
+  .msg .body { color: var(--ink-2); font-size: 13px; overflow-wrap: anywhere; white-space: pre-wrap; }
+  .msg.kind-verdict.fail, .msg.kind-error { border-color: rgba(208,59,59,.5); }
+  .msg.kind-verdict.pass, .msg.kind-passed { border-color: rgba(12,163,12,.4); }
+  .msg.kind-notify { border-color: var(--accent); }
+  .who.builder { color: #6da7ec; }
+  .who.tester { color: #d55181; }
+  .who.deployer { color: #c98500; }
+  .who.orchestrator { color: var(--ink-2); }
+  .who.you { color: var(--good); }
+  .divider { text-align: center; color: var(--muted); font-size: 11px; letter-spacing: 1px; text-transform: uppercase; padding: 6px 0 2px; }
+
+  /* ---------- prompts tab ---------- */
+  label.lbl { display: block; font-size: 12px; color: var(--muted); font-weight: 700; text-transform: uppercase; letter-spacing: .6px; margin: 10px 0 4px; }
+  input[type=text], textarea, select {
+    width: 100%; background: var(--page); border: 1px solid var(--hairline); color: var(--ink);
+    border-radius: 8px; padding: 8px 10px; font: inherit;
   }
-  details pre {
-    margin: 6px 0 2px; padding: 10px; border-radius: 8px;
-    background: var(--page); border: 1px solid var(--grid);
-    font-family: var(--mono); font-size: 12px;
-    white-space: pre-wrap; word-break: break-word;
-    max-height: 320px; overflow: auto;
+  textarea { resize: vertical; min-height: 90px; }
+  .drop {
+    border: 2px dashed var(--hairline); border-radius: 12px; padding: 22px; text-align: center;
+    color: var(--muted); cursor: pointer; margin-top: 8px;
   }
-  .vsteps { margin-top: 6px; display: flex; flex-direction: column; gap: 2px; }
-  .vstep { font-size: 12px; color: var(--ink-2); }
-  .vstep .ok { color: var(--good-text); font-weight: 650; }
-  .vstep .fail { color: var(--critical); font-weight: 650; }
+  .drop.over { border-color: var(--accent); color: var(--ink-2); }
+  .row2 { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  @media (max-width: 800px) { .row2 { grid-template-columns: 1fr; } }
+  .prompt-item { border: 1px solid var(--hairline); border-radius: 10px; padding: 10px 12px; margin-bottom: 10px; background: var(--surface-2); }
+  .prompt-item .head { display: flex; align-items: center; gap: 8px; }
+  .prompt-item .num { color: var(--muted); font-weight: 700; flex: none; width: 26px; }
+  .prompt-item input { flex: 1; }
+  .prompt-item textarea { margin-top: 8px; font-size: 13px; }
+  .icon-btn { background: none; border: 1px solid var(--hairline); color: var(--ink-2); border-radius: 6px; cursor: pointer; padding: 3px 8px; font-size: 12px; }
+  .icon-btn:hover { border-color: var(--muted); color: var(--ink); }
+  .toggle { display: flex; align-items: center; gap: 8px; margin-top: 10px; color: var(--ink-2); }
+  .hint { color: var(--muted); font-size: 12px; margin-top: 6px; }
+  .savebar { display: flex; gap: 10px; align-items: center; margin-top: 14px; flex-wrap: wrap; }
+  .note { font-size: 13px; color: var(--warning); }
+  .note.ok { color: var(--good); }
 
-  .tabs { display: flex; gap: 2px; margin-left: auto; }
-  .tabs button { border: 0; background: none; color: var(--muted); padding: 4px 10px; border-radius: 6px; font-size: 12px; }
-  .tabs button.active { background: var(--chip-idle-bg); color: var(--ink); }
-  select {
-    font: inherit; font-size: 12px; color: var(--ink);
-    background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 3px 6px;
-    max-width: 220px;
+  /* ---------- logs tab ---------- */
+  .logbar { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 12px; }
+  .logbar select { width: auto; }
+  .phase-filter { display: flex; gap: 6px; flex-wrap: wrap; }
+  .phase-filter .chip { cursor: pointer; }
+  .phase-filter .chip.sel { border-color: var(--accent); color: var(--ink); }
+  .ev { border: 1px solid var(--hairline); border-radius: 8px; padding: 8px 12px; margin-bottom: 8px; background: var(--surface); font-size: 13px; }
+  .ev .head { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; }
+  .ev time { color: var(--muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .ev .t { font-weight: 700; }
+  .ev .ph { color: var(--accent); font-size: 12px; }
+  .ev .sum { color: var(--ink-2); overflow-wrap: anywhere; }
+  .ev details { margin-top: 6px; }
+  .ev summary { cursor: pointer; color: var(--muted); font-size: 12px; }
+  .ev pre {
+    background: var(--page); border: 1px solid var(--hairline); border-radius: 8px;
+    padding: 10px; overflow-x: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+    font: 12px/1.5 ui-monospace, Consolas, monospace; color: var(--ink-2); max-height: 400px; overflow-y: auto;
   }
-
-  #feed { max-height: 640px; overflow: auto; padding: 6px 0; }
-  .ev { display: flex; gap: 10px; padding: 4px 14px; font-size: 13px; align-items: baseline; }
-  .ev:hover { background: var(--chip-idle-bg); }
-  .ev .t { color: var(--muted); font-family: var(--mono); font-size: 11px; flex: none; width: 62px; }
-  .ev .icon { flex: none; width: 1.3em; text-align: center; }
-  .ev .body { min-width: 0; flex: 1; color: var(--ink-2); }
-  .ev .body b { color: var(--ink); font-weight: 650; }
-  .ev.good .icon { color: var(--good-text); }
-  .ev.bad .icon { color: var(--critical); }
-  .ev.warn .icon { color: var(--serious); }
-  .ev.info .icon { color: var(--accent); }
-  .ev details { display: inline-block; }
-  .ev details summary { cursor: pointer; color: var(--accent); font-size: 12px; }
-  .ev details pre { max-width: 100%; }
-
-  #rawlog {
-    margin: 0; padding: 12px 14px; max-height: 640px; overflow: auto;
-    font-family: var(--mono); font-size: 12px; line-height: 1.45;
-    white-space: pre-wrap; word-break: break-word; color: var(--ink-2);
-  }
-
-  .empty { padding: 28px 16px; text-align: center; color: var(--muted); font-size: 13px; }
-  .empty code { font-family: var(--mono); background: var(--chip-idle-bg); padding: 1px 6px; border-radius: 6px; }
-
-  footer { margin-top: 20px; color: var(--muted); font-size: 11px; font-family: var(--mono); }
-  footer div { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-
-  #toast {
-    position: fixed; bottom: 18px; left: 50%; transform: translateX(-50%);
-    background: var(--ink); color: var(--page);
-    padding: 8px 16px; border-radius: 8px; font-size: 13px;
-    opacity: 0; pointer-events: none; transition: opacity 0.25s; z-index: 20;
-    max-width: 80vw;
-  }
-  #toast.show { opacity: 1; }
-  .offline-banner {
-    display: none; padding: 8px 20px; font-size: 12px; font-weight: 600;
-    background: var(--chip-crit-bg); color: var(--critical);
-  }
-  body.offline .offline-banner { display: block; }
+  .ev.bad { border-left: 3px solid var(--critical); }
+  .ev.good { border-left: 3px solid var(--good); }
+  .empty { color: var(--muted); text-align: center; padding: 30px 0; }
 </style>
 </head>
 <body>
 <header>
-  <div>
-    <h1>Prompt Chain Runner</h1>
-    <div class="sub" id="run-id">no runs yet</div>
+  <div class="brand">Prompt Chain Runner<small>autonomous build company</small></div>
+  <span class="pill" id="statusPill"><span class="dot"></span><span id="statusText">idle</span></span>
+  <div class="actions">
+    <button class="btn primary" id="btnStart">&#9654; Start run</button>
+    <button class="btn" id="btnStop" title="Finish the current step, then halt">&#9209; Stop</button>
+    <button class="btn danger" id="btnKill" title="Kill the runner and its Claude session immediately">Kill</button>
   </div>
-  <span class="pill" id="status-pill"><span class="dot"></span><span id="status-text">idle</span></span>
-  <div class="spacer"></div>
-  <label class="opt" title="Reset phases marked stuck and retry them"><input type="checkbox" id="opt-retry-stuck"> retry stuck</label>
-  <button class="primary" id="btn-start">&#9654; Start run</button>
-  <button id="btn-stop" title="Graceful: halts after the current step">&#9632; Stop</button>
-  <button class="danger" id="btn-kill" title="Force-kills the runner process tree">Kill</button>
-  <button id="btn-theme" title="Toggle light/dark">&#9681;</button>
+  <nav>
+    <button data-tab="live" class="active">Live</button>
+    <button data-tab="prompts">Prompts</button>
+    <button data-tab="logs">Logs</button>
+  </nav>
 </header>
-<div class="offline-banner">Dashboard server unreachable — is <code>node dashboard.js</code> still running?</div>
 
 <main>
-  <section class="tiles">
-    <div class="tile">
-      <div class="label">Phases passed</div>
-      <div class="value"><span id="t-passed">–</span><small id="t-total"></small></div>
-      <div class="meter"><div id="t-meter" style="width:0%"></div></div>
+  <!-- ================= LIVE ================= -->
+  <section class="tab visible" id="tab-live">
+    <div class="banner live" id="bannerLive"></div>
+    <div class="banner dead" id="bannerDead"></div>
+
+    <div class="tiles">
+      <div class="tile"><div class="k">Project</div><div class="v" id="tProject" style="font-size:18px">—</div><div class="s" id="tActivity"></div></div>
+      <div class="tile"><div class="k">Progress</div><div class="v" id="tProgress">—</div><div class="s">prompts passed</div></div>
+      <div class="tile"><div class="k">Elapsed</div><div class="v" id="tElapsed">—</div><div class="s" id="tStarted"></div></div>
+      <div class="tile"><div class="k">Cost</div><div class="v" id="tCost">—</div><div class="s" id="tCalls"></div></div>
     </div>
-    <div class="tile">
-      <div class="label">Current phase</div>
-      <div class="value" id="t-current" style="font-size:18px">–</div>
-      <div class="hint" id="t-attempt"></div>
+
+    <div class="card">
+      <h2>The company</h2>
+      <div class="agents">
+        <div class="agent" id="ag-orchestrator"><div class="name"><span class="dot"></span>Orchestrator</div><div class="role">routes work, verifies, commits</div><div class="doing"></div></div>
+        <div class="agent" id="ag-builder"><div class="name"><span class="dot"></span>Builder</div><div class="role">writes the code</div><div class="doing"></div></div>
+        <div class="agent" id="ag-tester"><div class="name"><span class="dot"></span>Tester</div><div class="role">verifies every claim</div><div class="doing"></div></div>
+        <div class="agent" id="ag-deployer"><div class="name"><span class="dot"></span>Deployer</div><div class="role">ships to GitHub Pages</div><div class="doing"></div></div>
+      </div>
     </div>
-    <div class="tile">
-      <div class="label">Claude calls</div>
-      <div class="value" id="t-calls">–</div>
-      <div class="hint" id="t-claude-time"></div>
+
+    <div class="card">
+      <h2>Pipeline</h2>
+      <div class="pipeline" id="pipeline"><span class="empty">No queue yet — import prompts in the Prompts tab.</span></div>
     </div>
-    <div class="tile">
-      <div class="label">Cost</div>
-      <div class="value" id="t-cost">–</div>
-      <div class="hint">reported by Claude Code</div>
-    </div>
-    <div class="tile">
-      <div class="label">Elapsed</div>
-      <div class="value" id="t-elapsed">–</div>
-      <div class="hint" id="t-updated"></div>
+
+    <div class="card">
+      <h2>Agent feed</h2>
+      <div class="feed" id="feed"><div class="empty">Waiting for a run…</div></div>
     </div>
   </section>
 
-  <div class="cols">
-    <section class="panel" id="pipeline-panel">
-      <div class="head">Phase pipeline <span class="count" id="phase-count"></span></div>
-      <div id="phases"><div class="empty">Loading…</div></div>
-    </section>
-
-    <section class="panel">
-      <div class="head">
-        <span id="feed-title">Activity</span>
-        <select id="run-select" title="Which run to inspect"><option value="">live</option></select>
-        <div class="tabs">
-          <button id="tab-feed" class="active">Activity</button>
-          <button id="tab-raw">Raw log</button>
+  <!-- ================= PROMPTS ================= -->
+  <section class="tab" id="tab-prompts">
+    <div class="card">
+      <h2>1 · Import your prompt file</h2>
+      <div class="row2">
+        <div>
+          <label class="lbl">Project name</label>
+          <input type="text" id="projectName" placeholder="my-portfolio-site">
+          <div class="toggle"><input type="checkbox" id="deployEnabled" checked> <span>Deploy to GitHub Pages when everything passes</span></div>
+          <label class="lbl">GitHub repo name (optional)</label>
+          <input type="text" id="repoName" placeholder="defaults to the project name">
+        </div>
+        <div>
+          <label class="lbl">Prompt file (.md / .txt)</label>
+          <div class="drop" id="drop">Drop your file here or click to choose.<br><span style="font-size:12px">Split on headings, --- separators, or "Prompt 1 / 2 / 3" numbering.</span></div>
+          <input type="file" id="file" accept=".md,.markdown,.txt,text/*" style="display:none">
         </div>
       </div>
-      <div id="feed"><div class="empty">No activity yet. Start a run to see every step live.</div></div>
-      <pre id="rawlog" style="display:none"></pre>
-    </section>
-  </div>
+      <label class="lbl">…or paste the prompts</label>
+      <textarea id="rawText" placeholder="## Prompt 1 — set up the project&#10;...&#10;## Prompt 2 — build the landing page&#10;..."></textarea>
+      <div class="savebar">
+        <button class="btn primary" id="btnParse">Parse into prompts</button>
+        <span class="note" id="parseNote"></span>
+      </div>
+    </div>
 
-  <footer id="paths"></footer>
+    <div class="card" id="previewCard" style="display:none">
+      <h2>2 · Review the queue</h2>
+      <label class="lbl">Shared project context (sent to the builder with every prompt)</label>
+      <textarea id="ctxText" placeholder="(optional)"></textarea>
+      <label class="lbl">Prompts, in order</label>
+      <div id="promptList"></div>
+      <div class="savebar">
+        <button class="btn" id="btnSave">Save queue</button>
+        <button class="btn primary" id="btnSaveStart">Save &amp; start the run</button>
+        <span class="note" id="saveNote"></span>
+      </div>
+      <div class="hint">After Start, no one touches anything: builder &rarr; checks &rarr; tester &rarr; fixes &rarr; commit, prompt by prompt, then deploy. You get a Windows notification when the site is live.</div>
+    </div>
+
+    <div class="card">
+      <h2>Currently saved queue</h2>
+      <div id="savedQueue" class="empty">Nothing saved yet.</div>
+    </div>
+  </section>
+
+  <!-- ================= LOGS ================= -->
+  <section class="tab" id="tab-logs">
+    <div class="card">
+      <div class="logbar">
+        <label class="lbl" style="margin:0">Run</label>
+        <select id="runSel"></select>
+        <div class="phase-filter" id="phaseFilter"></div>
+        <a id="rawLink" class="btn" target="_blank" style="margin-left:auto; text-decoration:none">Open raw log</a>
+      </div>
+      <div id="events"><div class="empty">No runs yet.</div></div>
+    </div>
+  </section>
 </main>
-<div id="toast"></div>
 
 <script>
 'use strict';
+/* ---------------- tiny DOM helpers (no innerHTML with dynamic data — XSS-safe) */
 const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
-
-// ---------- theme ----------
-const themeBtn = $('btn-theme');
-function applyTheme(t) {
-  if (t) document.documentElement.setAttribute('data-theme', t);
-  else document.documentElement.removeAttribute('data-theme');
+function h(tag, attrs = {}, ...children) {
+  const el = document.createElement(tag);
+  for (const [k, v] of Object.entries(attrs)) {
+    if (k === 'class') el.className = v;
+    else if (k === 'text') el.textContent = v;
+    else if (k === 'value') el.value = v;
+    else if (k.startsWith('on')) el.addEventListener(k.slice(2), v);
+    else el.setAttribute(k, v);
+  }
+  for (const c of children) if (c != null) el.append(c);
+  return el;
 }
-applyTheme(localStorage.getItem('pcr-theme'));
-themeBtn.onclick = () => {
-  const cur = document.documentElement.getAttribute('data-theme');
-  const sysDark = matchMedia('(prefers-color-scheme: dark)').matches;
-  const next = cur ? (cur === 'dark' ? 'light' : 'dark') : (sysDark ? 'light' : 'dark');
-  localStorage.setItem('pcr-theme', next);
-  applyTheme(next);
-};
-
-// ---------- toast ----------
-let toastTimer;
-function toast(msg) {
-  const el = $('toast');
-  el.textContent = msg;
-  el.classList.add('show');
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove('show'), 3500);
-}
-
-// ---------- state ----------
-let overview = null;
-let selectedRun = '';           // '' = follow the live/latest run
-let feedFile = null;            // events file currently being tailed
-let feedOffset = 0;
-let feedRemainder = '';         // partial JSONL line held until its tail arrives
-let events = [];
-let rawFile = null;
-let rawOffset = 0;
-let currentTab = 'feed';
-let pollInFlight = false;
-
-const STATUS_LABEL = {
-  pending: '○ pending',
-  running: '▶ running',
-  passed: '✓ passed',
-  failed_retry: '⚠ retrying',
-  stuck: '✕ stuck',
-};
-const RUN_LABEL = {
-  running: '▶ running',
-  passed_all: '✓ all phases passed',
-  stuck: '✕ stuck',
-  stopped: '■ stopped',
-  error: '✕ error',
-  interrupted: '■ interrupted',
-};
-
-function fmtDur(ms) {
-  if (ms == null || !isFinite(ms) || ms < 0) return '–';
+const fmtTime = (ts) => { try { return new Date(ts).toLocaleTimeString([], { hour12: false }); } catch { return ''; } };
+const fmtDur = (ms) => {
+  if (ms == null || !isFinite(ms) || ms < 0) return '—';
   const s = Math.floor(ms / 1000);
   if (s < 60) return s + 's';
   const m = Math.floor(s / 60);
   if (m < 60) return m + 'm ' + (s % 60) + 's';
   return Math.floor(m / 60) + 'h ' + (m % 60) + 'm';
-}
-function fmtTime(ts) {
-  try { return new Date(ts).toLocaleTimeString([], { hour12: false }); } catch { return ''; }
-}
-
-// ---------- rendering ----------
-function renderHeader() {
-  const st = overview?.state;
-  const active = overview?.runner_active;
-  const status = st ? (st.status === 'running' && !active ? 'crashed' : st.status) : 'idle';
-  const pill = $('status-pill');
-  pill.className = 'pill ' + (status === 'crashed' ? 'error' : status);
-  $('status-text').textContent =
-    status === 'crashed' ? '✕ crashed (process gone)' : (RUN_LABEL[status] || status);
-  $('run-id').textContent = st ? `${st.run_id}${overview.stop_flag && active ? ' — stop requested' : ''}` : 'no runs yet';
-  $('btn-start').disabled = Boolean(active);
-  $('btn-stop').disabled = !active;
-  $('btn-kill').disabled = !active;
-}
-
-function renderTiles() {
-  const st = overview?.state;
-  const phases = st?.phases || overview?.queue?.phases || [];
-  const passed = phases.filter((p) => p.status === 'passed').length;
-  $('t-passed').textContent = phases.length ? passed : '–';
-  $('t-total').textContent = phases.length ? ' / ' + phases.length : '';
-  $('t-meter').style.width = phases.length ? (100 * passed / phases.length) + '%' : '0%';
-
-  $('t-current').textContent = st?.current_phase || (st ? '—' : '–');
-  $('t-attempt').textContent = st?.message || '';
-
-  $('t-calls').textContent = st?.totals?.claude_calls ?? '–';
-  $('t-claude-time').textContent = st?.totals?.claude_ms ? fmtDur(st.totals.claude_ms) + ' in Claude Code' : '';
-  const cost = st?.totals?.cost_usd;
-  $('t-cost').textContent = cost != null ? '$' + Number(cost).toFixed(2) : '–';
-
-  if (st) {
-    const end = (st.status === 'running' && overview.runner_active) ? Date.now() : new Date(st.updated_at).getTime();
-    $('t-elapsed').textContent = fmtDur(end - new Date(st.started_at).getTime());
-    $('t-updated').textContent = 'updated ' + fmtTime(st.updated_at);
-  } else {
-    $('t-elapsed').textContent = '–';
-    $('t-updated').textContent = '';
-  }
-}
-
-// Latest verification info per phase, distilled from the event feed.
-function verifySummaryByPhase() {
-  const map = {};
-  for (const ev of events) {
-    if (ev.type === 'verify_start') map[ev.phase] = [];
-    else if (ev.type === 'verify_step') (map[ev.phase] = map[ev.phase] || []).push(ev);
-  }
-  return map;
-}
-
-function renderPhases() {
-  const queuePhases = overview?.queue?.phases || [];
-  const statePhases = new Map((overview?.state?.phases || []).map((p) => [p.id, p]));
-  const box = $('phases');
-  $('phase-count').textContent = queuePhases.length ? `${queuePhases.length} phases` : '';
-  if (!queuePhases.length) {
-    box.innerHTML = '<div class="empty">No phases found. Fill in <code>prompts/queue.json</code> and refresh.</div>';
-    return;
-  }
-  const vmap = verifySummaryByPhase();
-  const openSet = new Set([...box.querySelectorAll('details[open]')].map((d) => d.dataset.key));
-
-  box.innerHTML = queuePhases.map((p, i) => {
-    const live = statePhases.get(p.id) || p;
-    const status = live.status || 'pending';
-    const vsteps = (vmap[p.id] || []).map((ev) => `
-      <div class="vstep">
-        <span class="${ev.passed ? 'ok' : 'fail'}">${ev.passed ? '✓' : '✕'}</span>
-        ${esc(ev.step)} <span style="color:var(--muted)">(${fmtDur(ev.duration_ms)})</span>
-        ${!ev.passed && ev.output ? `<details class="vout" data-key="v-${esc(p.id)}-${esc(ev.step)}"><summary>error output</summary><pre>${esc(ev.output)}</pre></details>` : ''}
-      </div>`).join('');
-    return `
-    <div class="phase">
-      <div class="row">
-        <span class="num">${i + 1}.</span>
-        <span class="id">${esc(p.id)}</span>
-        <span class="chip ${esc(status)}">${STATUS_LABEL[status] || esc(status)}</span>
-        <span class="meta">
-          ${live.retries ? `<span title="retries used">↻ ${live.retries}</span>` : ''}
-          ${live.commit_hash ? `<span class="hash" title="${esc(live.commit_hash)}">${esc(String(live.commit_hash).slice(0, 8))}</span>` : ''}
-        </span>
-      </div>
-      <details class="prompt" data-key="p-${esc(p.id)}">
-        <summary>prompt</summary>
-        <pre>${esc(p.prompt)}</pre>
-      </details>
-      ${vsteps ? `<div class="vsteps">${vsteps}</div>` : ''}
-    </div>`;
-  }).join('');
-
-  for (const d of box.querySelectorAll('details')) {
-    if (openSet.has(d.dataset.key)) d.open = true;
-  }
-}
-
-const EV_RENDER = {
-  run_start: (e) => ['info', '▶', `run started — ${e.phases?.length ?? '?'} phases, max ${e.max_retries} retries each`],
-  phase_start: (e) => ['info', '■', `<b>${esc(e.phase)}</b> started (${e.index + 1}/${e.total})`],
-  attempt_start: (e) => ['info', '↻', `<b>${esc(e.phase)}</b> attempt ${e.attempt}/${e.max_attempts} (${esc(e.kind)} prompt)`],
-  claude_start: (e) => ['info', '✦', `sending prompt to Claude Code (${e.prompt_chars >= 1000 ? (e.prompt_chars / 1000).toFixed(1) + 'k' : e.prompt_chars} chars)`],
-  claude_done: (e) => ['good', '✦', `Claude Code finished in ${fmtDur(e.duration_ms)}${Number.isFinite(+e.cost_usd) && e.cost_usd !== null ? ` — $${(+e.cost_usd).toFixed(4)}` : ''}${e.result ? ` <details><summary>result</summary><pre>${esc(e.result)}</pre></details>` : ''}`],
-  claude_error: (e) => ['bad', '✕', `Claude Code call failed <details><summary>error</summary><pre>${esc(e.error)}</pre></details>`],
-  verify_start: (e) => ['info', '⚖', `verifying <b>${esc(e.phase)}</b>: ${e.steps?.map(esc).join(' → ') || 'no steps configured'}`],
-  verify_step_start: (e) => ['info', '⋯', `running check <b>${esc(e.step)}</b> — <span style="font-family:var(--mono)">${esc(e.command)}</span>`],
-  verify_step: (e) => e.passed
-    ? ['good', '✓', `check <b>${esc(e.step)}</b> passed (${fmtDur(e.duration_ms)})`]
-    : ['bad', '✕', `check <b>${esc(e.step)}</b> FAILED (exit ${e.exit_code ?? 'killed'}) <details><summary>output</summary><pre>${esc(e.output)}</pre></details>`],
-  verify_result: (e) => e.all_passed
-    ? ['good', '✓', `<b>${esc(e.phase)}</b> passed all verification`]
-    : ['warn', '⚠', `<b>${esc(e.phase)}</b> failed verification: ${e.failed_steps?.map(esc).join(', ')}`],
-  fix_prompt: (e) => ['warn', '✎', `auto-generated fix prompt for <b>${esc(e.phase)}</b> <details><summary>view prompt</summary><pre>${esc(e.prompt)}</pre></details>`],
-  commit: (e) => ['good', '⎇', `committed <b>${esc(e.phase)}</b> → <span style="font-family:var(--mono)">${esc(String(e.hash).slice(0, 8))}</span>`],
-  phase_passed: (e) => ['good', '⚑', `<b>${esc(e.phase)}</b> PASSED after ${e.retries} ${e.retries === 1 ? 'retry' : 'retries'}`],
-  phase_stuck: (e) => ['bad', '⛔', `<b>${esc(e.phase)}</b> STUCK after ${e.retries} attempts (${esc(e.reason || '')})`],
-  stop_requested: () => ['warn', '■', 'stop requested — halting gracefully'],
-  run_done: (e) => [e.status === 'passed_all' ? 'good' : e.status === 'stopped' ? 'warn' : 'bad', '⚑', `run finished: <b>${esc(e.status)}</b> — ${esc(e.message)}`],
-  run_error: (e) => ['bad', '✕', `runner crashed <details><summary>stack</summary><pre>${esc(e.error)}</pre></details>`],
 };
 
-function renderNewEvents(newOnes) {
-  const feed = $('feed');
-  if (events.length && feed.querySelector('.empty')) feed.innerHTML = '';
-  const stick = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 60;
-  const frag = document.createDocumentFragment();
-  for (const ev of newOnes) {
-    const fn = EV_RENDER[ev.type];
-    if (!fn) continue;
-    const [cls, icon, html] = fn(ev);
-    const div = document.createElement('div');
-    div.className = 'ev ' + cls;
-    div.innerHTML = `<span class="t">${fmtTime(ev.ts)}</span><span class="icon">${icon}</span><span class="body">${html}</span>`;
-    frag.appendChild(div);
-  }
-  feed.appendChild(frag);
-  while (feed.children.length > 1500) feed.removeChild(feed.firstChild);
-  if (stick) feed.scrollTop = feed.scrollHeight;
+async function api(path, body) {
+  const res = await fetch(path, body === undefined ? {} : {
+    method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(body),
+  });
+  let data = null;
+  try { data = await res.json(); } catch { /* raw endpoints */ }
+  return { status: res.status, data };
 }
 
-function resetFeed() {
-  events = [];
-  feedOffset = 0;
-  feedRemainder = '';
-  $('feed').innerHTML = '<div class="empty">Loading events…</div>';
-  rawOffset = 0;
-  $('rawlog').textContent = '';
-}
+/* ---------------- tabs */
+document.querySelectorAll('nav button').forEach((b) => b.addEventListener('click', () => {
+  document.querySelectorAll('nav button').forEach((x) => x.classList.toggle('active', x === b));
+  document.querySelectorAll('.tab').forEach((t) => t.classList.toggle('visible', t.id === 'tab-' + b.dataset.tab));
+}));
 
-// ---------- data fetching ----------
-async function api(path, opts) {
-  const res = await fetch(path, opts);
-  if (!res.ok) {
-    let msg = res.status + ' ' + res.statusText;
-    try { const b = await res.json(); if (b.error) msg = b.error; } catch { /* ignore */ }
-    throw new Error(msg);
-  }
-  return res.json();
-}
-
-function currentRunInfo() {
-  if (!overview) return null;
-  if (selectedRun) return overview.runs.find((r) => r.run_id === selectedRun) || null;
-  if (overview.state) {
-    return overview.runs.find((r) => r.run_id === overview.state.run_id) || overview.runs[0] || null;
-  }
-  return overview.runs[0] || null;
-}
-
-function renderRunSelect() {
-  const sel = $('run-select');
-  const runs = overview?.runs || [];
-  const want = ['<option value="">live (latest)</option>']
-    .concat(runs.map((r) => `<option value="${esc(r.run_id)}"${r.run_id === selectedRun ? ' selected' : ''}>${esc(r.run_id)}</option>`))
-    .join('');
-  if (sel.dataset.rendered !== want) { sel.innerHTML = want; sel.dataset.rendered = want; }
-}
-
-async function pollTails() {
-  const info = currentRunInfo();
-  if (!info) return;
-  if (info.events && info.events !== feedFile) { feedFile = info.events; resetFeed(); }
-  if (info.log) rawFile = info.log;
-
-  if (feedFile) {
+/* ---------------- events store: incremental JSONL tails per file.
+   Single-flight per file: overlapping polls would fetch the same offset twice
+   and permanently duplicate events, so concurrent callers share one request. */
+const tails = new Map(); // file -> { offset, buf, events, pending }
+function tailEvents(file) {
+  if (!file) return Promise.resolve([]);
+  if (!tails.has(file)) tails.set(file, { offset: 0, buf: '', events: [], pending: null });
+  const t = tails.get(file);
+  if (t.pending) return t.pending;
+  t.pending = (async () => {
     try {
-      let guard = 0;
-      while (guard++ < 20) {
-        const r = await api(`/api/tail?file=${encodeURIComponent(feedFile)}&offset=${feedOffset}`);
-        if (r.offset === feedOffset && !r.data) break;
-        feedOffset = r.offset;
-        if (r.data) {
-          // A poll can catch the runner mid-append; hold the trailing partial
-          // line until the rest of it arrives instead of dropping the event.
-          const text = feedRemainder + r.data;
-          const lines = text.split('\n');
-          feedRemainder = lines.pop() ?? '';
-          const fresh = lines.filter(Boolean).map((line) => {
-            try { return JSON.parse(line); } catch { return null; }
-          }).filter(Boolean);
-          if (fresh.length) {
-            events.push(...fresh);
-            renderNewEvents(fresh);
-            renderPhases();
-          }
+      const { data } = await api(`/api/tail?file=${encodeURIComponent(file)}&offset=${t.offset}`);
+      if (!data || data.error) return t.events;
+      if (data.offset < t.offset) { t.offset = 0; t.buf = ''; t.events = []; } // rotated/truncated
+      if (data.data) {
+        t.offset = data.offset;
+        t.buf += data.data;
+        const lines = t.buf.split('\n');
+        t.buf = lines.pop(); // last piece may be a partial line
+        for (const line of lines) {
+          if (!line.trim()) continue;
+          try { t.events.push(JSON.parse(line)); } catch { /* skip garbage */ }
         }
-        if (r.offset >= r.size) break;
       }
-    } catch { /* transient */ }
-  }
-
-  if (rawFile && currentTab === 'raw') {
-    try {
-      let guard = 0;
-      while (guard++ < 20) {
-        const r = await api(`/api/tail?file=${encodeURIComponent(rawFile)}&offset=${rawOffset}`);
-        if (r.offset === rawOffset && !r.data) break;
-        rawOffset = r.offset;
-        if (r.data) {
-          const el = $('rawlog');
-          const stick = el.scrollHeight - el.scrollTop - el.clientHeight < 60;
-          el.textContent += r.data;
-          if (el.textContent.length > 1_500_000) el.textContent = el.textContent.slice(-1_000_000);
-          if (stick) el.scrollTop = el.scrollHeight;
-        }
-        if (r.offset >= r.size) break;
-      }
-    } catch { /* transient */ }
-  }
+    } catch { /* server briefly away — keep what we have */
+    } finally {
+      t.pending = null;
+    }
+    return t.events;
+  })();
+  return t.pending;
 }
+
+/* Agent-supplied URLs (deploy reports) become links only if they are real
+   web URLs — never javascript: or anything else. */
+function linkOrText(url) {
+  return /^https?:\/\//i.test(String(url || ''))
+    ? h('a', { href: url, target: '_blank', text: url })
+    : h('span', { text: String(url || '') });
+}
+
+/* ---------------- global poll */
+let overview = null;
+let currentRunEvents = [];
+let feedRendered = 0;
+let feedFile = null;
 
 async function poll() {
-  if (pollInFlight) return; // overlapping polls would race the shared offsets
-  pollInFlight = true;
   try {
-    overview = await api('/api/overview');
-    document.body.classList.remove('offline');
-    renderHeader();
-    renderTiles();
-    renderPhases();
-    renderRunSelect();
-    $('paths').innerHTML = `
-      <div>root: ${esc(overview.root)}</div>
-      <div>project: ${esc(overview.state?.project_path || overview.queue?.project_path || '?')}</div>`;
-    await pollTails();
-  } catch {
-    document.body.classList.add('offline');
-  } finally {
-    pollInFlight = false;
+    const { data } = await api('/api/overview');
+    if (data) overview = data;
+  } catch { /* retry next tick */ }
+  if (overview?.state?.events_file) {
+    if (feedFile !== overview.state.events_file) { feedFile = overview.state.events_file; feedRendered = 0; $('feed').replaceChildren(); }
+    currentRunEvents = await tailEvents(feedFile);
   }
+  render();
+  renderLogsTab(false);
 }
-
-// ---------- controls ----------
-$('btn-start').onclick = async () => {
-  $('btn-start').disabled = true; // instantly — a double-click must not double-start
-  try {
-    const r = await api('/api/run/start', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ retryStuck: $('opt-retry-stuck').checked }),
-    });
-    toast(r.ok ? `Runner started (pid ${r.pid})` : r.error);
-    selectedRun = '';
-    setTimeout(poll, 600);
-  } catch (e) { toast('Start failed: ' + e.message); }
-};
-$('btn-stop').onclick = async () => {
-  try { const r = await api('/api/run/stop', { method: 'POST' }); toast(r.note || 'Stop requested'); }
-  catch (e) { toast('Stop failed: ' + e.message); }
-};
-$('btn-kill').onclick = async () => {
-  if (!confirm('Force-kill the runner process? The current phase will be left half-done (git has the last good commit).')) return;
-  try { const r = await api('/api/run/kill', { method: 'POST' }); toast(r.killed ? `Killed pid ${r.killed}` : (r.note || 'Nothing to kill')); setTimeout(poll, 600); }
-  catch (e) { toast('Kill failed: ' + e.message); }
-};
-$('run-select').onchange = (e) => {
-  selectedRun = e.target.value;
-  feedFile = null; rawFile = null;
-  resetFeed();
-  poll();
-};
-$('tab-feed').onclick = () => switchTab('feed');
-$('tab-raw').onclick = () => switchTab('raw');
-function switchTab(tab) {
-  currentTab = tab;
-  $('tab-feed').classList.toggle('active', tab === 'feed');
-  $('tab-raw').classList.toggle('active', tab === 'raw');
-  $('feed').style.display = tab === 'feed' ? '' : 'none';
-  $('rawlog').style.display = tab === 'raw' ? '' : 'none';
-  if (tab === 'raw') poll(); // guarded — never a second concurrent tail loop
-}
-
-poll();
 setInterval(poll, 1500);
+poll();
+
+/* ---------------- header + live tab rendering */
+function render() {
+  const st = overview?.state || null;
+  const status = overview?.runner_active ? 'running' : (st?.status && st.status !== 'running' ? st.status : 'idle');
+
+  const pill = $('statusPill');
+  pill.className = 'pill ' + status;
+  $('statusText').textContent = status === 'passed_all' ? 'all done' : status;
+
+  $('btnStart').disabled = Boolean(overview?.runner_active);
+  $('btnStop').disabled = !overview?.runner_active;
+  $('btnKill').disabled = !overview?.runner_active;
+
+  /* tiles */
+  $('tProject').textContent = st?.project_name || overview?.queue?.project_name || '—';
+  $('tActivity').textContent = st?.activity?.detail || st?.message || '';
+  const phases = st?.phases?.length ? st.phases : (overview?.queue?.phases || []);
+  const passed = phases.filter((p) => p.status === 'passed').length;
+  $('tProgress').textContent = phases.length ? `${passed}/${phases.length}` : '—';
+  if (st?.started_at) {
+    const end = (status === 'running') ? Date.now() : new Date(st.updated_at || st.started_at).getTime();
+    $('tElapsed').textContent = fmtDur(end - new Date(st.started_at).getTime());
+    $('tStarted').textContent = 'started ' + fmtTime(st.started_at);
+  } else { $('tElapsed').textContent = '—'; $('tStarted').textContent = ''; }
+  $('tCost').textContent = st?.totals ? '$' + (st.totals.cost_usd ?? 0).toFixed(2) : '—';
+  $('tCalls').textContent = st?.totals ? `${st.totals.claude_calls} agent calls` : '';
+
+  /* agents */
+  const activeAgent = (status === 'running') ? (st?.activity?.agent || null) : null;
+  for (const name of ['orchestrator', 'builder', 'tester', 'deployer']) {
+    const el = $('ag-' + name);
+    const isActive = activeAgent === name || (name === 'orchestrator' && status === 'running');
+    el.classList.toggle('active', isActive);
+    el.querySelector('.doing').textContent =
+      (activeAgent === name || (name === 'orchestrator' && activeAgent === null && status === 'running'))
+        ? (st?.activity?.detail || '') : '';
+  }
+
+  /* pipeline */
+  const pipe = $('pipeline');
+  pipe.replaceChildren();
+  if (!phases.length) {
+    pipe.append(h('span', { class: 'empty', text: 'No queue yet — import prompts in the Prompts tab.' }));
+  } else {
+    phases.forEach((p, i) => {
+      if (i) pipe.append(h('span', { class: 'arrow', text: '→' }));
+      const stTxt = { pending: 'queued', running: 'building', passed: 'passed', failed_retry: 'fixing', stuck: 'STUCK' }[p.status] || p.status;
+      const chip = h('span', { class: 'chip ' + p.status, title: `${p.title || p.id} — ${stTxt}${p.retries ? `, ${p.retries} retr${p.retries > 1 ? 'ies' : 'y'}` : ''}` },
+        h('span', { class: 'dot' }),
+        h('span', { class: 'txt', text: p.title || p.id }),
+        h('span', { class: 'st', text: stTxt }));
+      if (p.retries) chip.append(h('span', { class: 'n', text: `(${p.retries})` }));
+      pipe.append(chip);
+    });
+    const dep = st?.deploy || (overview?.queue?.deploy?.enabled !== false ? { enabled: true, status: 'pending', repo_name: overview?.queue?.deploy?.repo_name } : null);
+    if (dep && dep.enabled) {
+      pipe.append(h('span', { class: 'arrow', text: '→' }));
+      const dTxt = { pending: 'queued', deploying: 'deploying', live: 'LIVE', failed: 'FAILED', disabled: 'off' }[dep.status] || dep.status;
+      pipe.append(h('span', { class: 'chip ' + dep.status, title: 'GitHub Pages deploy' },
+        h('span', { class: 'dot' }), h('span', { class: 'txt', text: '🚀 ' + (dep.repo_name || 'deploy') }), h('span', { class: 'st', text: dTxt })));
+    }
+  }
+
+  /* banners */
+  const live = $('bannerLive'), dead = $('bannerDead');
+  live.className = 'banner live'; dead.className = 'banner dead';
+  if (st?.status === 'passed_all') {
+    live.replaceChildren(
+      h('div', { class: 'big', text: '✅ ' + (st.project_name || 'Project') + ' — finished, tested' + (st.deploy?.pages_url ? ' and LIVE' : '') }),
+      st.deploy?.pages_url ? h('div', {}, 'Live site: ', linkOrText(st.deploy.pages_url)) : null,
+      st.deploy?.repo_url ? h('div', {}, 'Repository: ', linkOrText(st.deploy.repo_url)) : null);
+    live.classList.add('show');
+  } else if (st?.status === 'stuck' || st?.status === 'error') {
+    dead.replaceChildren(
+      h('div', { class: 'big', text: '⛔ Run halted: ' + (st.message || st.status) }),
+      h('div', { text: 'Check the Logs tab for the evidence, then press Start — stuck prompts are revived and retried automatically.' }));
+    dead.classList.add('show');
+  }
+
+  /* feed — append only the new events */
+  const feed = $('feed');
+  const feedEvents = currentRunEvents;
+  const nearBottom = feed.scrollHeight - feed.scrollTop - feed.clientHeight < 80;
+  if (feedRendered === 0) feed.replaceChildren();
+  for (; feedRendered < feedEvents.length; feedRendered++) {
+    const ev = feedEvents[feedRendered];
+    if (ev.type === 'run_start') {
+      feed.append(h('div', { class: 'divider', text: `run started — ${ev.run_id || ''}` }));
+    } else if (ev.type === 'phase_start') {
+      feed.append(h('div', { class: 'divider', text: `— ${ev.title || ev.phase} (${(ev.index ?? 0) + 1}/${ev.total || '?'}) —` }));
+    } else if (ev.type === 'deploy_start') {
+      feed.append(h('div', { class: 'divider', text: '— deploy —' }));
+    } else if (ev.type === 'run_done') {
+      feed.append(h('div', { class: 'divider', text: `run ${ev.status}: ${ev.message || ''}` }));
+    } else if (ev.type === 'agent_msg') {
+      const cls = 'msg kind-' + (ev.kind || 'info') + (ev.kind === 'verdict' ? (String(ev.text || '').startsWith('PASS') ? ' pass' : ' fail') : '');
+      feed.append(h('div', { class: cls },
+        h('time', { text: fmtTime(ev.ts) }),
+        h('span', { class: 'who ' + ev.from, text: ev.from + (ev.to && ev.to !== ev.from ? ' → ' + ev.to : '') + ':' }),
+        h('span', { class: 'body', text: ev.text || '' })));
+    } else if (ev.type === 'notification') {
+      feed.append(h('div', { class: 'msg kind-notify' },
+        h('time', { text: fmtTime(ev.ts) }),
+        h('span', { class: 'who you', text: '🔔 notification:' }),
+        h('span', { class: 'body', text: `${ev.title} — ${ev.message}${ev.url ? ' · ' + ev.url : ''}` })));
+    }
+  }
+  if (feed.childElementCount === 0) feed.append(h('div', { class: 'empty', text: 'Waiting for a run…' }));
+  else if (nearBottom) feed.scrollTop = feed.scrollHeight;
+
+  renderSavedQueue();
+}
+
+/* ---------------- header actions */
+$('btnStart').addEventListener('click', async () => {
+  // If the last run halted stuck, Start revives the stuck prompts too.
+  const stuck = overview?.state?.status === 'stuck';
+  const r = await api('/api/run/start', stuck ? { retryStuck: true } : {});
+  if (!r.data?.ok) alert(r.data?.error || 'Could not start.');
+});
+$('btnStop').addEventListener('click', () => api('/api/run/stop', {}));
+$('btnKill').addEventListener('click', () => {
+  if (confirm('Kill the runner and its in-flight Claude session immediately?')) api('/api/run/kill', {});
+});
+
+/* ================= PROMPTS tab ================= */
+let draft = null; // { context, prompts: [{title, prompt}] }
+
+$('drop').addEventListener('click', () => $('file').click());
+$('drop').addEventListener('dragover', (e) => { e.preventDefault(); $('drop').classList.add('over'); });
+$('drop').addEventListener('dragleave', () => $('drop').classList.remove('over'));
+$('drop').addEventListener('drop', (e) => {
+  e.preventDefault(); $('drop').classList.remove('over');
+  const f = e.dataTransfer.files?.[0];
+  if (f) readFile(f);
+});
+$('file').addEventListener('change', () => { if ($('file').files[0]) readFile($('file').files[0]); });
+
+function readFile(f) {
+  const reader = new FileReader();
+  reader.onload = () => {
+    $('rawText').value = String(reader.result || '');
+    if (!$('projectName').value) $('projectName').value = f.name.replace(/\.(md|markdown|txt)$/i, '');
+    parseNow();
+  };
+  reader.readAsText(f);
+}
+
+$('btnParse').addEventListener('click', parseNow);
+async function parseNow() {
+  const content = $('rawText').value;
+  const note = $('parseNote');
+  note.className = 'note';
+  note.textContent = '';
+  if (!content.trim()) { note.textContent = 'Nothing to parse — add a file or paste text.'; return; }
+  const r = await api('/api/prompts/import', { content });
+  if (!r.data?.ok) { note.textContent = r.data?.error || 'Parse failed.'; return; }
+  draft = { context: r.data.preamble || '', prompts: r.data.prompts.map((p) => ({ title: p.title, prompt: p.prompt })) };
+  note.className = 'note ok';
+  note.textContent = `Found ${draft.prompts.length} prompt${draft.prompts.length > 1 ? 's' : ''} (split by ${r.data.strategy}).`;
+  renderDraft();
+}
+
+function renderDraft() {
+  $('previewCard').style.display = draft ? '' : 'none';
+  if (!draft) return;
+  $('ctxText').value = draft.context;
+  const list = $('promptList');
+  list.replaceChildren();
+  draft.prompts.forEach((p, i) => {
+    const titleInput = h('input', { type: 'text', value: p.title, oninput: (e) => { p.title = e.target.value; } });
+    const bodyTa = h('textarea', { text: p.prompt, oninput: (e) => { p.prompt = e.target.value; } });
+    list.append(h('div', { class: 'prompt-item' },
+      h('div', { class: 'head' },
+        h('span', { class: 'num', text: '#' + (i + 1) }),
+        titleInput,
+        h('button', { class: 'icon-btn', title: 'move up', text: '↑', onclick: () => { if (i > 0) { [draft.prompts[i - 1], draft.prompts[i]] = [draft.prompts[i], draft.prompts[i - 1]]; renderDraft(); } } }),
+        h('button', { class: 'icon-btn', title: 'move down', text: '↓', onclick: () => { if (i < draft.prompts.length - 1) { [draft.prompts[i + 1], draft.prompts[i]] = [draft.prompts[i], draft.prompts[i + 1]]; renderDraft(); } } }),
+        h('button', { class: 'icon-btn', title: 'remove', text: '✕', onclick: () => { draft.prompts.splice(i, 1); renderDraft(); } })),
+      bodyTa));
+  });
+}
+
+$('ctxText').addEventListener('input', () => { if (draft) draft.context = $('ctxText').value; });
+
+async function saveQueue() {
+  const note = $('saveNote');
+  if (!draft || !draft.prompts.length) { note.textContent = 'Nothing to save.'; return null; }
+  const body = {
+    project_name: $('projectName').value.trim() || 'my-site',
+    context: draft.context,
+    deploy: { enabled: $('deployEnabled').checked, repo_name: $('repoName').value.trim() },
+    prompts: draft.prompts,
+  };
+  const r = await api('/api/prompts/save', body);
+  note.className = 'note' + (r.data?.ok ? ' ok' : '');
+  note.textContent = r.data?.ok ? 'Queue saved.' : (r.data?.error || 'Save failed.');
+  return r.data?.ok ? r.data.queue : null;
+}
+$('btnSave').addEventListener('click', saveQueue);
+$('btnSaveStart').addEventListener('click', async () => {
+  const q = await saveQueue();
+  if (!q) return;
+  const r = await api('/api/run/start', {});
+  $('saveNote').textContent = r.data?.ok
+    ? 'Queue saved — run started. Watch it on the Live tab.'
+    : (r.data?.error || 'Could not start.');
+  if (r.data?.ok) document.querySelector('nav button[data-tab=live]').click();
+});
+
+function renderSavedQueue() {
+  const q = overview?.queue;
+  const box = $('savedQueue');
+  if (!q?.phases?.length) { box.className = 'empty'; box.textContent = 'Nothing saved yet.'; return; }
+  box.className = '';
+  box.replaceChildren(
+    h('div', { style: 'margin-bottom:8px' },
+      h('strong', { text: q.project_name || '(unnamed project)' }),
+      h('span', { style: 'color: var(--muted)', text: `  ·  ${q.phases.length} prompts  ·  deploy ${q.deploy?.enabled !== false ? 'on → ' + (q.deploy?.repo_name || 'auto') : 'off'}` })),
+    ...q.phases.map((p, i) => h('div', { style: 'padding:3px 0; color: var(--ink-2)', text: `${i + 1}. [${p.status}] ${p.title || p.id}` })));
+}
+
+/* ================= LOGS tab ================= */
+let logRun = null;      // selected events file
+let logPhase = 'all';
+let logRendered = -1;   // force first render
+
+$('runSel').addEventListener('change', () => { logRun = $('runSel').value; logPhase = 'all'; logRendered = -1; renderLogsTab(true); });
+
+function phaseOf(ev) {
+  if (ev.phase) return ev.phase;
+  if (ev.type?.startsWith('deploy') || ev.type?.startsWith('live_check')) return 'deploy';
+  return null;
+}
+
+async function renderLogsTab(force) {
+  const runs = overview?.runs || [];
+  const sel = $('runSel');
+  const known = runs.map((r) => r.events).filter(Boolean);
+  if (sel.dataset.known !== known.join(',')) {
+    sel.dataset.known = known.join(',');
+    sel.replaceChildren(...runs.filter((r) => r.events).map((r) => h('option', { value: r.events, text: r.run_id })));
+    if (!logRun && known.length) { logRun = known[0]; logRendered = -1; }
+    if (logRun) sel.value = logRun;
+  }
+  if (!logRun) return;
+
+  const run = runs.find((r) => r.events === logRun);
+  $('rawLink').style.display = run?.log ? '' : 'none';
+  if (run?.log) $('rawLink').href = '/api/raw?file=' + encodeURIComponent(run.log);
+
+  const events = await tailEvents(logRun);
+
+  /* phase filter chips */
+  const phases = [];
+  for (const ev of events) {
+    const p = phaseOf(ev);
+    if (p && !phases.includes(p)) phases.push(p);
+  }
+  const pf = $('phaseFilter');
+  const wantChips = ['all', ...phases].join(',') + '|' + logPhase;
+  if (pf.dataset.known !== wantChips) {
+    pf.dataset.known = wantChips;
+    pf.replaceChildren(...['all', ...phases].map((p) => h('span', {
+      class: 'chip' + (logPhase === p ? ' sel' : ''),
+      text: p,
+      onclick: () => { logPhase = p; logRendered = -1; renderLogsTab(true); },
+    })));
+  }
+
+  /* Append-only rendering: a full rebuild would collapse every <details> the
+     user has expanded. Rebuild only on run/filter change (logRendered < 0). */
+  const box = $('events');
+  if (force || logRendered < 0) { box.replaceChildren(); logRendered = 0; }
+  if (logRendered >= events.length) {
+    if (!box.childElementCount) box.append(h('div', { class: 'empty', text: 'No events here yet.' }));
+    return;
+  }
+  if (box.firstElementChild?.classList.contains('empty')) box.replaceChildren();
+  for (; logRendered < events.length; logRendered++) {
+    const ev = events[logRendered];
+    if (logPhase !== 'all' && phaseOf(ev) !== logPhase) continue;
+    const node = renderEvent(ev);
+    if (node) box.append(node);
+  }
+  if (!box.childElementCount) box.append(h('div', { class: 'empty', text: 'No events here yet.' }));
+}
+
+function pre(text) { return h('pre', { text: String(text ?? '') }); }
+function det(summary, node) { const d = h('details', {}, h('summary', { text: summary })); d.append(node); return d; }
+
+function renderEvent(ev) {
+  if (ev.type === 'verify_start' || ev.type === 'verify_step_start' || ev.type === 'claude_start') return null;
+  const el = h('div', { class: 'ev' });
+  const head = h('div', { class: 'head' }, h('time', { text: fmtTime(ev.ts) }), h('span', { class: 't', text: ev.type }));
+  if (ev.phase) head.append(h('span', { class: 'ph', text: ev.phase }));
+  if (ev.agent) head.append(h('span', { class: 'ph', text: ev.agent }));
+  el.append(head);
+  const sum = (t) => el.append(h('div', { class: 'sum', text: t }));
+
+  switch (ev.type) {
+    case 'run_start': sum(`run ${ev.run_id} — ${(ev.phases || []).length} prompts, max ${ev.max_retries} retries`); break;
+    case 'phase_start': sum(ev.title || ev.phase); el.append(det('full prompt', pre(ev.prompt))); break;
+    case 'attempt_start': sum(`attempt ${ev.attempt}/${ev.max_attempts} (${ev.kind})`); break;
+    case 'claude_done':
+      sum(`${ev.agent || 'claude'} finished in ${fmtDur(ev.duration_ms)} · $${ev.cost_usd ?? '?'}`);
+      if (ev.report) el.append(det('builder report', pre(JSON.stringify(ev.report, null, 2))));
+      if (ev.deploy) el.append(det('deploy report', pre(JSON.stringify(ev.deploy, null, 2))));
+      if (ev.result) el.append(det('agent message', pre(ev.result)));
+      break;
+    case 'claude_error': el.classList.add('bad'); sum(ev.error || 'agent call failed'); break;
+    case 'verify_step':
+      el.classList.add(ev.passed ? 'good' : 'bad');
+      sum(`check "${ev.step}" ${ev.passed ? 'passed' : `FAILED (exit ${ev.exit_code})`} in ${fmtDur(ev.duration_ms)} — ${ev.command}`);
+      if (!ev.passed && ev.output) el.append(det('output', pre(ev.output)));
+      break;
+    case 'verify_result': sum(ev.all_passed ? `all checks passed (${(ev.steps || []).join(', ') || 'none applied'})` : `failed: ${(ev.failed_steps || []).join(', ')}`); break;
+    case 'verdict':
+      el.classList.add(ev.pass ? 'good' : 'bad');
+      sum(`tester: ${ev.pass ? 'PASS' : 'FAIL'} — ${ev.summary || ''}`);
+      if (ev.failures?.length) el.append(det('failures', pre(JSON.stringify(ev.failures, null, 2))));
+      break;
+    case 'fix_prompt': sum(`fix prompt sent (attempt ${ev.attempt})`); el.append(det('full fix prompt', pre(ev.prompt))); break;
+    case 'commit': el.classList.add('good'); sum(`commit ${String(ev.hash || '').slice(0, 10)}`); break;
+    case 'phase_passed': el.classList.add('good'); sum(`phase passed after ${ev.retries} retr${ev.retries === 1 ? 'y' : 'ies'}`); break;
+    case 'phase_stuck': el.classList.add('bad'); sum(`STUCK after ${ev.retries} attempts (${ev.reason})`); break;
+    case 'agent_msg': sum(`${ev.from} → ${ev.to}: ${ev.text}`); break;
+    case 'deploy_start': sum(`deploying to GitHub repo "${ev.repo_name}"`); break;
+    case 'live_check_start': sum(`orchestrator polling ${ev.url}`); break;
+    case 'live_check_result': el.classList.add(ev.live ? 'good' : 'bad'); sum(ev.live ? 'site is LIVE (verified independently)' : 'live check failed'); if (ev.evidence) el.append(det('evidence', pre(ev.evidence))); break;
+    case 'deploy_done': el.classList.add('good'); sum(`deployed — ${ev.pages_url}`); break;
+    case 'deploy_stuck': el.classList.add('bad'); sum('deploy stuck'); if (ev.evidence) el.append(det('evidence', pre(ev.evidence))); break;
+    case 'notification': sum(`🔔 ${ev.title} — ${ev.message}${ev.url ? ' · ' + ev.url : ''} (${ev.channel})`); break;
+    case 'run_done': el.classList.add(ev.status === 'passed_all' ? 'good' : 'bad'); sum(`${ev.status}: ${ev.message}`); break;
+    case 'run_error': el.classList.add('bad'); el.append(det('error', pre(ev.error))); break;
+    case 'stop_requested': sum('graceful stop requested'); break;
+    default: el.append(det('data', pre(JSON.stringify(ev, null, 2))));
+  }
+  return el;
+}
 </script>
 </body>
 </html>

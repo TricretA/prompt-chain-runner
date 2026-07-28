@@ -3,10 +3,13 @@ logs/*.log
 logs/*.jsonl
 state.json
 .stop
+.runner.lock
 
-# The project Claude Code builds lives in its own repo, not this one
+# The projects Claude Code builds live in their own repos, not this one
 target-project/**
 !target-project/.gitkeep
+projects/**
+!projects/.gitkeep
 
 # Test workspaces
 test/.tmp/
