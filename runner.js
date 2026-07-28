@@ -48,7 +48,7 @@ const { notify } = require('./lib/notify');
 const { detectCapabilities, describeCapabilities, pickDeployTarget } = require('./lib/capabilities');
 const { sendRemote } = require('./lib/remote-notify');
 const { recordLesson, findLessons, formatLessons } = require('./lib/lessons');
-const { loadBacklog, nextPending, markStatus } = require('./lib/backlog');
+const { loadBacklog, readBacklog, nextPending, markStatus } = require('./lib/backlog');
 
 const ROOT = __dirname;
 
@@ -169,8 +169,12 @@ function main() {
   const maxAttempts = maxRetries + 1;
   const onStuck = config.on_stuck === 'halt' ? 'halt' : 'continue';
   const testerEnabled = config.tester?.enabled !== false;
+  // Counts are normalized once here so an explicit 0 ("never do this") is not
+  // swallowed by a `|| default` further down.
   const designCfg = { enabled: true, rounds: 1, ...(config.design || {}) };
+  designCfg.rounds = Number.isFinite(designCfg.rounds) ? Math.max(0, Math.trunc(designCfg.rounds)) : 1;
   const securityCfg = { enabled: true, block_deploy: true, max_fix_rounds: 2, ...(config.security || {}) };
+  securityCfg.max_fix_rounds = Number.isFinite(securityCfg.max_fix_rounds) ? Math.max(0, Math.trunc(securityCfg.max_fix_rounds)) : 2;
   const budgetCfg = config.budget || {};
   const lessonsFile = path.join(ROOT, 'memory', 'lessons.jsonl');
   const lessonsEnabled = config.lessons?.enabled !== false;
@@ -338,8 +342,16 @@ function main() {
   function trackCall(res) {
     totals.claude_calls += 1;
     totals.claude_ms += res.durationMs;
+    // A session that was killed or crashed printed no parseable JSON — but it
+    // was still billed. Charging it $0 would make the budget cap blind to
+    // exactly the runaway it exists to stop, so unpriced time is estimated.
     if (res.parsed && typeof res.parsed.total_cost_usd === 'number') {
       totals.cost_usd = Math.round((totals.cost_usd + res.parsed.total_cost_usd) * 10000) / 10000;
+    } else if (res.durationMs > 5000) {
+      const rate = budgetCfg.unpriced_usd_per_hour ?? 6;
+      const estimate = Math.round((rate * (res.durationMs / 3600000)) * 10000) / 10000;
+      totals.cost_usd = Math.round((totals.cost_usd + estimate) * 10000) / 10000;
+      logger.event('unpriced_call', { duration_ms: res.durationMs, estimated_usd: estimate, error: res.error || null });
     }
     // Clear the recorded agent pid ON DISK the moment the call resolves —
     // the dashboard's Kill must never see a pid that has already been reused.
@@ -349,8 +361,12 @@ function main() {
   // Money is the one thing an unattended run can burn without limit, so the cap
   // is checked before every agent call, not just between phases.
   function budgetLeft() {
-    const cap = budgetCfg.max_usd_per_run;
-    return cap ? cap - totals.cost_usd : Infinity;
+    // A cap of 0 means "spend nothing" — the one value a truthiness test would
+    // read as "no cap at all".
+    const raw = budgetCfg.max_usd_per_run;
+    if (raw === null || raw === undefined) return Infinity;
+    const cap = Number(raw);
+    return Number.isFinite(cap) ? cap - totals.cost_usd : Infinity;
   }
 
   async function assertBudget(where) {
@@ -363,20 +379,43 @@ function main() {
   // --- The outer loop: this project, then everything on the backlog ---------
   async function runEverything() {
     let built = 0;
+    let worst = null;
+    const problems = [];
     while (true) {
       const outcome = await runProject();
       built += 1;
-      const backlogItems = loadBacklog(opts.backlog);
+      // The run's exit code must reflect the worst project, not the last one —
+      // otherwise a failure is erased by whatever gets built after it.
+      if (!worst || outcome.exitCode > worst.exitCode) worst = outcome;
+      if (outcome.exitCode !== 0) problems.push(outcome.message);
+
+      // An unreadable backlog is not an empty backlog. Ending the night early
+      // and calling it success would strand every queued project silently.
+      const read = readBacklog(opts.backlog);
+      if (!read.ok) {
+        logger.event('backlog_unreadable', { file: opts.backlog });
+        await finish('stuck', `Could not read the backlog at ${opts.backlog}; ${built} project(s) built. Fix the file and start again.`, 2);
+        return;
+      }
+      const backlogItems = read.items;
       const next = nextPending(backlogItems);
       syncState({ backlog: { done: built, remaining: backlogItems.filter((i) => i.status === 'pending').length } });
       if (!next) {
-        await finish(outcome.status, `${outcome.message}${built > 1 ? ` (${built} projects this run)` : ''}`, outcome.exitCode);
+        const summary = problems.length
+          ? `${worst.message}${problems.length > 1 ? ` (+${problems.length - 1} more project(s) had problems)` : ''}`
+          : worst.message;
+        await finish(worst.status, `${summary}${built > 1 ? ` — ${built} projects this run` : ''}`, worst.exitCode);
         return;
       }
       if (stopRequested()) stopNow();
       logger.section(`NEXT PROJECT FROM BACKLOG: ${next.project_name}`);
       say('orchestrator', 'orchestrator', null, 'backlog', `Starting the next queued project: ${next.project_name}`);
-      markStatus(opts.backlog, next.id, 'running');
+      // If this cannot be persisted, the same item would be picked forever.
+      if (!markStatus(opts.backlog, next.id, 'running')) {
+        logger.event('backlog_unwritable', { file: opts.backlog, id: next.id });
+        await finish('stuck', `Could not update the backlog at ${opts.backlog} (read-only or locked); refusing to loop on the same project.`, 2);
+        return;
+      }
       queue = materializeBacklogItem(next);
       persist();
     }
@@ -556,12 +595,23 @@ function main() {
       return { status: degraded.length ? 'passed_with_issues' : 'passed_all', message: msg, exitCode: 0 };
     }
 
-    if (state.deploy.status === 'live' && state.deploy.pages_url) {
-      logger.log(`Skipping deploy — already live at ${state.deploy.pages_url}`);
-      logger.event('deploy_skipped', { pages_url: state.deploy.pages_url });
+    // Only skip a redeploy when the tree that went live is still the tree we
+    // have. A resume that revived a phase, or a design/security round, creates
+    // new commits — publishing must happen again or we would report success
+    // while the public site still serves the old build.
+    const headNow = headCommit(projectPath);
+    if (state.deploy.status === 'live' && state.deploy.pages_url
+      && queue.deploy_state?.commit && queue.deploy_state.commit === headNow) {
+      logger.log(`Skipping deploy — already live at ${state.deploy.pages_url} and nothing changed since.`);
+      logger.event('deploy_skipped', { pages_url: state.deploy.pages_url, commit: headNow });
       const msg = `${projectName} was already live at ${state.deploy.pages_url}`;
       finishProjectInBacklog('done', { message: msg, pages_url: state.deploy.pages_url });
       return { status: 'passed_all', message: msg, exitCode: 0 };
+    }
+    if (state.deploy.status === 'live') {
+      logger.log('The project has new commits since it last went live — redeploying.');
+      state.deploy.status = 'pending';
+      state.deploy.retries = 0;
     }
 
     const deployed = await runDeployStage({ projectPath, projectName, repoName, deployCfg, context: projectContext });
@@ -636,8 +686,9 @@ function main() {
       }
 
       // --- rung: throw the broken work away and start this prompt over -------
+      let reverted = false;
       if (strategy === 'fresh_start' && goodCommit) {
-        const reverted = revertTo(projectPath, goodCommit);
+        reverted = revertTo(projectPath, goodCommit);
         logger.log(`fresh start: ${reverted ? `reverted to ${goodCommit.slice(0, 8)}` : 'revert failed, continuing on the current tree'}`);
         logger.event('revert', { phase: phase.id, attempt, commit: goodCommit, ok: reverted });
         if (reverted) say('orchestrator', 'builder', phase.id, 'revert', `Rolled back to the last good commit. Start over and take a different approach.`);
@@ -666,7 +717,7 @@ function main() {
           projectPath, config, onSpawn,
           fixPrompt: buildFixPrompt({
             originalPrompt: phase.prompt, autoResults: lastAutoResults, verdict: lastVerdict, config,
-            strategy, lessons: lessonsText, diagnosis, attemptHistory: history.join('\n\n'),
+            strategy, lessons: lessonsText, diagnosis, attemptHistory: history.join('\n\n'), reverted,
           }),
         });
       trackCall(build);
@@ -869,7 +920,11 @@ function main() {
   // --- Security ------------------------------------------------------------
   // Returns true when publication must be blocked.
   async function runSecurityStage({ projectPath, context, target }) {
-    for (let round = 1; round <= (securityCfg.max_fix_rounds || 2) + 1; round++) {
+    // Whatever the agent returns, the orchestrator handles a list.
+    const asFindings = (v) => (Array.isArray(v) ? v : v == null ? [] : [v])
+      .map((c) => (c && typeof c === 'object' ? c : { what: String(c) }));
+
+    for (let round = 1; round <= securityCfg.max_fix_rounds + 1; round++) {
       if (stopRequested()) stopNow();
       await assertBudget('security');
       logger.section(`SECURITY GATE (round ${round})`);
@@ -893,21 +948,40 @@ function main() {
         return false;
       }
 
-      const critical = s.critical || [];
-      say('security', 'orchestrator', 'security', s.pass ? 'verdict' : 'error',
-        `${s.pass ? 'PASS' : 'BLOCKED'} — ${truncate(s.summary || '', 300)}${critical.length ? ` (${critical.length} critical)` : ''}`);
-      if ((s.changes_made || []).length) {
-        commitPhase(projectPath, 'security', 'auto: security agent removed a secret');
+      const critical = asFindings(s.critical);
+      // An explicit boolean is required, exactly as the tester's verdict is:
+      // "false", 1, "no" or a missing field must never read as permission to
+      // publish, and a stated failure outranks an empty findings list.
+      const passed = s.pass === true && !critical.length;
+      say('security', 'orchestrator', 'security', passed ? 'verdict' : 'error',
+        `${passed ? 'PASS' : 'BLOCKED'} — ${truncate(s.summary || '', 300)}${critical.length ? ` (${critical.length} critical)` : ''}`);
+
+      // The security agent may edit files (removing a secret is its one allowed
+      // repair) — re-gate those edits the same way the designer's are.
+      if (asFindings(s.changes_made).length) {
+        const before = headCommit(projectPath);
+        const v = await verifyPhase(projectPath, config, logger, 'security', stopRequested);
+        if (v.aborted) stopNow();
+        if (v.allPassed) {
+          commitPhase(projectPath, 'security', 'auto: security agent removed a secret');
+        } else {
+          const failed = Object.entries(v.results).filter(([, r]) => !r.passed).map(([n]) => n);
+          logger.event('security_reverted', { round, failed_steps: failed });
+          revertTo(projectPath, before);
+          say('orchestrator', 'orchestrator', 'security', 'revert', `The security agent's edits broke ${failed.join(', ')} — rolled them back.`);
+        }
       }
-      if (s.pass || !critical.length) return false;
-      if (round > (securityCfg.max_fix_rounds || 2)) break;
+
+      if (passed) return false;
+      if (round > securityCfg.max_fix_rounds) break;
       if (!securityCfg.block_deploy) return false;
 
       // Send it back to a builder to repair, then audit again.
       await assertBudget('security fix');
-      setActivity('builder', `security: builder fixing ${critical.length} critical finding(s)`);
-      say('orchestrator', 'builder', 'security', 'fix', `Security blocked release: ${truncate(critical.map((c) => c.what).join('; '), 300)}`);
-      const fix = await runBuilderFix({ projectPath, config, onSpawn, fixPrompt: buildSecurityFixPrompt({ security: s, context }) });
+      const blockedBy = critical.length ? `${critical.length} critical finding(s)` : truncate(s.summary || 'a stated failure', 120);
+      setActivity('builder', `security: builder fixing ${blockedBy}`);
+      say('orchestrator', 'builder', 'security', 'fix', `Security blocked release: ${truncate(critical.map((c) => c.what).join('; ') || s.summary || '', 300)}`);
+      const fix = await runBuilderFix({ projectPath, config, onSpawn, fixPrompt: buildSecurityFixPrompt({ security: { ...s, critical }, context }) });
       trackCall(fix);
       logger.event('claude_done', { phase: 'security', agent: 'builder', attempt: round, ok: fix.ok, duration_ms: fix.durationMs, cost_usd: fix.parsed?.total_cost_usd ?? null, report: fix.report || null });
       const verification = await verifyPhase(projectPath, config, logger, 'security', stopRequested);
@@ -987,7 +1061,13 @@ function main() {
 
       if (!evidence) {
         state.deploy.status = 'live';
-        queue.deploy_state = { status: 'live', repo_url: state.deploy.repo_url, pages_url: state.deploy.pages_url };
+        // The commit identity is what makes the skip-on-rerun safe.
+        queue.deploy_state = {
+          status: 'live',
+          repo_url: state.deploy.repo_url,
+          pages_url: state.deploy.pages_url,
+          commit: headCommit(projectPath),
+        };
         syncState();
         persist();
         logger.log(`DEPLOY VERIFIED LIVE: ${state.deploy.pages_url}`);

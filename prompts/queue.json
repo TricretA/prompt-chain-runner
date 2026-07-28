@@ -1,48 +1,12 @@
 {
-  "project_name": "alex-reyes-portfolio",
-  "project_path": "./projects/alex-reyes-portfolio",
-  "context": "This is a one-page portfolio site for a freelance photographer named Alex Reyes.\nDark, minimal, fast. Static HTML/CSS/JS only — no frameworks, no build step.\nAll images are placeholders from https://picsum.photos.",
+  "project_name": "nairobi-bakery",
+  "project_path": "./projects/nairobi-bakery",
+  "context": "",
+  "brief": "A one-page site for a family bakery in Nairobi - menu, gallery, opening hours and a WhatsApp order button. Warm and simple.",
   "deploy": {
     "enabled": true,
-    "repo_name": "alex-reyes-portfolio"
+    "target": "vercel",
+    "repo_name": "nairobi-bakery"
   },
-  "phases": [
-    {
-      "id": "prompt-1",
-      "title": "Prompt 1 — scaffold the site",
-      "prompt": "Create the project skeleton: index.html, css/styles.css, js/main.js.\nSemantic HTML5 layout with header, nav, main, footer. Mobile-first CSS with a\ndark palette and one accent color. Wire the stylesheet and script up and make\nsure the page opens cleanly in a browser.",
-      "status": "passed",
-      "retries": 0,
-      "commit_hash": "2863e79df29ed5afb991db709ad81483b2471c50"
-    },
-    {
-      "id": "prompt-2",
-      "title": "Prompt 2 — hero and gallery",
-      "prompt": "Build the hero section (name, one-line tagline, call-to-action button that\nscrolls to the gallery) and a responsive photo gallery: a grid of 9 placeholder\nimages that opens a lightbox on click (plain JS, no libraries). Keyboard\nnavigation (arrows + Escape) in the lightbox.",
-      "status": "passed",
-      "retries": 0,
-      "commit_hash": "722cde44ef7149d012f725623c3275de09e99026"
-    },
-    {
-      "id": "prompt-3",
-      "title": "Prompt 3 — about and contact",
-      "prompt": "Add an About section (short bio, portrait placeholder) and a Contact section\nwith a mailto link and social icons (inline SVG). Smooth-scroll navigation\nbetween all sections; highlight the active section in the nav.",
-      "status": "passed",
-      "retries": 1,
-      "commit_hash": "76d98cea5f66adefc09e3933d2368898f66fd9e4"
-    },
-    {
-      "id": "prompt-4",
-      "title": "Prompt 4 — polish and ship-readiness",
-      "prompt": "Add meta description, Open Graph tags, a favicon (inline SVG data URI is fine),\nlazy-loading on gallery images, and a footer with the current year computed in\nJS. Make sure the page has no console errors and looks right at 360px, 768px,\nand 1440px widths.",
-      "status": "passed",
-      "retries": 0,
-      "commit_hash": "a4709c7355b3842f1febbdc696c61cd0cc7ceaa1"
-    }
-  ],
-  "deploy_state": {
-    "status": "live",
-    "repo_url": "https://github.com/TricretA/alex-reyes-portfolio",
-    "pages_url": "https://tricreta.github.io/alex-reyes-portfolio/"
-  }
+  "phases": []
 }

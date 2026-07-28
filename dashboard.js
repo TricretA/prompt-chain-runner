@@ -129,19 +129,34 @@ function readBody(req) {
 // event; the pidLooksLikeNode check is the backstop against OS pid reuse.
 let spawnedRunnerPid = null;
 
-function runnerIsActive() {
+function lockPid() {
+  try {
+    const pid = parseInt(fs.readFileSync(path.join(DATA_ROOT, '.runner.lock'), 'utf8'), 10);
+    return Number.isFinite(pid) ? pid : null;
+  } catch {
+    return null;
+  }
+}
+
+// Returns WHICH pid is the live runner, not merely that one exists — the
+// watchdog has to know whether the process it can see is the same one
+// state.json is describing before it declares that run wedged.
+function activeRunnerPid() {
   if (spawnedRunnerPid) {
-    if (pidAlive(spawnedRunnerPid) && pidLooksLikeNode(spawnedRunnerPid)) return true;
+    if (pidAlive(spawnedRunnerPid) && pidLooksLikeNode(spawnedRunnerPid)) return spawnedRunnerPid;
     spawnedRunnerPid = null; // dead or recycled — self-heal
   }
   // A runner started outside the dashboard holds .runner.lock from before its
   // first state.json write — honor it for its whole lifetime.
-  try {
-    const lockPid = parseInt(fs.readFileSync(path.join(DATA_ROOT, '.runner.lock'), 'utf8'), 10);
-    if (lockPid && pidAlive(lockPid) && pidLooksLikeNode(lockPid)) return true;
-  } catch { /* no lock */ }
+  const held = lockPid();
+  if (held && pidAlive(held) && pidLooksLikeNode(held)) return held;
   const state = readState(STATE_FILE);
-  return Boolean(state && state.status === 'running' && pidAlive(state.pid) && pidLooksLikeNode(state.pid));
+  if (state && state.status === 'running' && pidAlive(state.pid) && pidLooksLikeNode(state.pid)) return state.pid;
+  return null;
+}
+
+function runnerIsActive() {
+  return Boolean(activeRunnerPid());
 }
 
 function startRunner({ retryStuck = false } = {}) {
@@ -184,15 +199,34 @@ function startRunner({ retryStuck = false } = {}) {
 // a request path: the answer is computed once off the hot path at boot (and
 // refreshed hourly) and served from this variable meanwhile.
 let capabilitiesText = '';
-function refreshCapabilities() {
+const CAP_CACHE = path.join(DATA_ROOT, '.capabilities.json');
+
+// Serve whatever is already on disk (even if stale) without probing anything.
+function readCapabilitiesCache() {
   try {
-    const cfg = safeReadJson(CONFIG_FILE) || {};
-    capabilitiesText = describeCapabilities(detectCapabilities({
-      cacheFile: path.join(DATA_ROOT, '.capabilities.json'),
-      ttlMs: cfg.capabilities?.cache_ms,
-      override: cfg.capabilities?.override,
-    }));
-  } catch { /* the dashboard works fine without this label */ }
+    capabilitiesText = describeCapabilities(JSON.parse(fs.readFileSync(CAP_CACHE, 'utf8'))) || capabilitiesText;
+  } catch { /* nothing cached yet */ }
+}
+
+// The probes are ~10 blocking spawnSync calls. Running them here would freeze
+// the HTTP server AND the watchdog for the better part of a minute, so the
+// refresh happens in a throwaway child process and we just re-read its cache.
+function refreshCapabilities() {
+  const cfg = safeReadJson(CONFIG_FILE) || {};
+  if (cfg.capabilities?.override) {
+    try { capabilitiesText = describeCapabilities(detectCapabilities({ override: cfg.capabilities.override })); } catch { /* ignore */ }
+    return;
+  }
+  readCapabilitiesCache();
+  try {
+    const child = spawn(process.execPath, [
+      '-e',
+      `require(${JSON.stringify(path.join(ROOT, 'lib', 'capabilities.js'))})` +
+      `.detectCapabilities({ refresh: true, cacheFile: ${JSON.stringify(CAP_CACHE)} })`,
+    ], { cwd: ROOT, windowsHide: true, stdio: 'ignore', detached: false });
+    child.on('exit', readCapabilitiesCache);
+    child.on('error', () => { /* the dashboard works fine without this label */ });
+  } catch { /* ignore */ }
 }
 
 // --- Watchdog --------------------------------------------------------------
@@ -200,21 +234,50 @@ function refreshCapabilities() {
 // reboot, an OOM, or an agent session wedged forever. The dashboard is the
 // only always-on process, so it does the supervising. Restarts are capped so
 // a genuinely broken queue can't become an infinite respawn loop.
-const watchdogReport = { restarts: 0, last_restart: null, last_reason: null, disabled: false };
+const watchdogReport = { restarts: 0, last_restart: null, last_reason: null, disabled: false, disabled_until: null };
 const RESTART_WINDOW_MS = 60 * 60 * 1000;
 const MAX_RESTARTS_PER_WINDOW = 4;
 let restartTimes = [];
 
 function watchdogTick() {
   const cfg = safeReadJson(CONFIG_FILE) || {};
-  if (cfg.watchdog?.enabled === false || watchdogReport.disabled) return;
+  if (cfg.watchdog?.enabled === false) return;
+  // Giving up is time-bounded, not permanent: a genuinely broken queue stops
+  // the respawn loop for an hour, it does not disable supervision for the life
+  // of the dashboard.
+  if (watchdogReport.disabled_until) {
+    if (Date.now() < watchdogReport.disabled_until) return;
+    watchdogReport.disabled_until = null;
+    watchdogReport.disabled = false;
+    restartTimes = [];
+  }
+  // An explicit human stop outranks auto-resume, always.
+  if (fs.existsSync(STOP_FILE)) {
+    watchdogReport.last_reason = 'stop flag present — watchdog standing down';
+    return;
+  }
 
   const state = readState(STATE_FILE);
   if (!state || state.status !== 'running') return; // nothing claims to be running
-  if (runnerIsActive()) {
-    // Alive — but is it making progress? A heartbeat that stops advancing means
-    // an agent session is wedged past any timeout that should have killed it.
-    const staleMs = cfg.watchdog?.heartbeat_stale_ms ?? 45 * 60 * 1000;
+
+  const live = activeRunnerPid();
+  if (live) {
+    // Only judge staleness for the process state.json is actually describing.
+    // A brand-new runner that has not written state yet must never be blamed
+    // for the previous run's stale heartbeat — restarting on that would kill
+    // its lock and leave two runners in the same tree.
+    if (live !== state.pid) return;
+
+    // A heartbeat only advances when the runner calls syncState(), and nothing
+    // does that while an agent session is in flight. So the window must exceed
+    // the longest agent timeout, or every long builder call looks like a hang.
+    const maxAgentMs = Math.max(
+      cfg.claude_timeout_ms || 3600000,
+      cfg.planner_timeout_ms || 0, cfg.tester_timeout_ms || 0,
+      cfg.debugger_timeout_ms || 0, cfg.design_timeout_ms || 0,
+      cfg.security_timeout_ms || 0, cfg.verify_timeout_ms || 0,
+    );
+    const staleMs = Math.max(cfg.watchdog?.heartbeat_stale_ms ?? 45 * 60 * 1000, maxAgentMs + 10 * 60 * 1000);
     const beat = Date.parse(state.heartbeat || state.updated_at || 0);
     if (!Number.isFinite(beat) || Date.now() - beat < staleMs) return;
     restart(`no heartbeat for ${Math.round((Date.now() - beat) / 60000)} min — the run looks wedged`, state);
@@ -227,7 +290,8 @@ function restart(reason, state) {
   restartTimes = restartTimes.filter((t) => Date.now() - t < RESTART_WINDOW_MS);
   if (restartTimes.length >= MAX_RESTARTS_PER_WINDOW) {
     watchdogReport.disabled = true;
-    watchdogReport.last_reason = `gave up: ${MAX_RESTARTS_PER_WINDOW} restarts in an hour (${reason})`;
+    watchdogReport.disabled_until = Date.now() + RESTART_WINDOW_MS;
+    watchdogReport.last_reason = `paused for an hour: ${MAX_RESTARTS_PER_WINDOW} restarts in an hour (${reason})`;
     console.error(`[watchdog] ${watchdogReport.last_reason}`);
     return;
   }
@@ -463,9 +527,14 @@ const routes = {
       writeState(STATE_FILE, { ...state, status: 'stopped', message: 'Killed from the dashboard.', claude_pid: null });
     }
     // A force-killed runner never runs its exit handler — release its lock on
-    // its behalf so the next Start doesn't have to steal it.
-    try { fs.rmSync(path.join(DATA_ROOT, '.runner.lock'), { force: true }); } catch { /* ignore */ }
-    spawnedRunnerPid = null;
+    // its behalf. But only if the lock isn't held by a DIFFERENT, live runner:
+    // state.json can be stale while a fresh runner is still booting, and
+    // deleting its lock would destroy the single-instance guard.
+    const held = lockPid();
+    if (!held || killed.includes(held) || !pidAlive(held) || !pidLooksLikeNode(held)) {
+      try { fs.rmSync(path.join(DATA_ROOT, '.runner.lock'), { force: true }); } catch { /* ignore */ }
+      spawnedRunnerPid = null;
+    }
     json(res, 200, killed.length
       ? { ok: true, killed }
       : { ok: true, killed: null, note: 'No live runner process found.' });

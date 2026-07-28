@@ -44,6 +44,14 @@ process.stdin.on('end', () => {
     process.exit(1);
   }
 
+  // A session that burns time and is killed before printing its JSON result —
+  // the case where the real CLI is billed but reports no cost.
+  if (call.hang) {
+    console.log('working...');
+    setInterval(() => {}, 1000);
+    return;
+  }
+
   console.log(JSON.stringify({
     type: 'result',
     subtype: 'success',

@@ -887,6 +887,115 @@ test('lessons: a fix that worked is remembered and offered on the next failure',
   assert.strictEqual(formatLessons([]), '', 'no block when there is nothing to say');
 });
 
+// ---------------------------------------------------------------- v3 review regressions
+test('a rebuild after a successful deploy is republished, not silently skipped', () => {
+  const c = setupCase('deploy-restale', {
+    phases: [{ id: 'p1', prompt: 'build it' }, { id: 'p2', prompt: 'the flaky one' }],
+    calls: [
+      { files: { 'app.txt': 'GOOD' } },                 // p1 passes
+      { files: { 'app.txt': 'BAD' } },                  // p2 fails...
+      { files: { 'app.txt': 'BAD' } },                  // ...and degrades
+      { files: { '.pcr/deploy.json': JSON.stringify({ target: 'github-pages', repo_url: 'https://github.com/x/y', pages_url: 'https://x.github.io/y/', live: true }) } },
+    ],
+    config: { on_stuck: 'continue', max_retries: 1, deploy: { enabled: true, verify_live: false, target: 'github-pages' } },
+  });
+  const first = runRunner(c);
+  assert.strictEqual(first.status, 0, `run 1: got ${first.status}\n${first.stdout}\n${first.stderr}`);
+  const deployState = readJson(c.queueFile).deploy_state;
+  assert.strictEqual(deployState.status, 'live');
+  assert.match(deployState.commit, /^[0-9a-f]{40}$/, 'what went live is recorded by commit');
+
+  // Revive the degraded phase; it now succeeds and creates a NEW commit.
+  fs.writeFileSync(path.join(c.project, 'mock-scenario.json'), JSON.stringify({
+    calls: [
+      { files: { 'app.txt': 'GOOD at last' } },
+      { files: { '.pcr/deploy.json': JSON.stringify({ target: 'github-pages', repo_url: 'https://github.com/x/y', pages_url: 'https://x.github.io/y/', live: true }) } },
+    ],
+  }));
+  fs.rmSync(path.join(c.project, 'mock-state.json'), { force: true });
+  const second = runRunner(c, ['--retry-stuck']);
+  assert.strictEqual(second.status, 0, `run 2: got ${second.status}\n${second.stdout}\n${second.stderr}`);
+
+  const events = runEvents(c);
+  const deploys = events.filter((e) => e.type === 'deploy_start');
+  assert.strictEqual(deploys.length, 2, 'the rebuilt project was deployed again, not reported as already live');
+  assert.strictEqual(readJson(c.queueFile).phases[1].status, 'passed');
+});
+
+test('an agent session killed without printing a cost still charges the budget', () => {
+  const c = setupCase('budget-unpriced', {
+    phases: [{ id: 'p1', prompt: 'a' }, { id: 'p2', prompt: 'b' }],
+    calls: [{ hang: true }],
+    config: { budget: { max_usd_per_run: 0.02, unpriced_usd_per_hour: 3600 }, claude_timeout_ms: 6000, max_retries: 5 },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 2, `expected exit 2, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  const state = readJson(c.stateFile);
+  assert.strictEqual(state.status, 'budget_exhausted', 'the cap fired despite no cost being reported');
+  assert.ok(state.totals.cost_usd > 0, `unpriced time was estimated, got ${state.totals.cost_usd}`);
+  assert.ok(runEvents(c).some((e) => e.type === 'unpriced_call'), 'the estimate is logged, not hidden');
+});
+
+test('a security verdict that is not exactly true blocks publication', () => {
+  const c = setupCase('security-truthy', {
+    phases: [{ id: 'p1', prompt: 'build it' }],
+    calls: [
+      { files: { 'app.txt': 'GOOD' } },
+      // "pass": "false" is a STRING — truthy in JS, and an empty critical list
+      { files: { '.pcr/security.json': JSON.stringify({ pass: 'false', summary: 'do not publish this', critical: [], warnings: [] }) } },
+    ],
+    config: { security: { enabled: true, block_deploy: true, max_fix_rounds: 0 }, deploy: { enabled: true, verify_live: false, target: 'github-pages' } },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 2, `expected exit 2 (blocked), got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  assert.ok(!claudeCalls(c).some((x) => /DEPLOYER agent/.test(x.prompt)), 'never deployed');
+});
+
+test('malformed agent JSON degrades gracefully instead of killing the run', () => {
+  const { buildFixPrompt, buildSecurityFixPrompt } = require('../lib/fix-prompt');
+  // Every one of these is a shape the schema forbids but a model can emit.
+  for (const bad of ['src/app.js', { a: 1 }, 42, null, undefined, [' ', '']]) {
+    const p = buildFixPrompt({
+      originalPrompt: 't', strategy: 'diagnosis',
+      diagnosis: { root_cause: 'x', files_to_change: bad },
+    });
+    assert.match(p, /files to change:/, `threw or omitted for ${JSON.stringify(bad)}`);
+  }
+  for (const bad of ['a secret leaked', { what: 'k' }, null]) {
+    assert.doesNotThrow(() => buildSecurityFixPrompt({ security: { critical: bad, summary: 's' }, context: '' }));
+  }
+  const noRevert = buildFixPrompt({ originalPrompt: 't', strategy: 'fresh_start', reverted: false });
+  assert.match(noRevert, /STILL PRESENT/, 'a failed revert is stated honestly, not claimed as clean');
+});
+
+test('agent JSON wrapped in a code fence or BOM is still read', () => {
+  const { readAgentFile } = require('../lib/agents');
+  const dir = path.join(TMP, 'agent-json');
+  rmrf(dir);
+  fs.mkdirSync(path.join(dir, '.pcr'), { recursive: true });
+  fs.writeFileSync(path.join(dir, '.pcr', 'verdict.json'), '﻿```json\n{"pass": true, "summary": "fenced"}\n```');
+  const v = readAgentFile(dir, 'verdict');
+  assert.ok(v && v.pass === true, `a fenced/BOM verdict must not be thrown away, got ${JSON.stringify(v)}`);
+});
+
+test('explicit zeros in config mean zero, not the default', () => {
+  const { detectCapabilities } = require('../lib/capabilities');
+  // budget cap of 0 must mean "spend nothing", not "no cap"
+  const c = setupCase('zero-budget', {
+    phases: [{ id: 'p1', prompt: 'a' }],
+    calls: [{ files: { 'app.txt': 'GOOD' } }],
+    config: { budget: { max_usd_per_run: 0 } },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 2, `expected exit 2, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  assert.strictEqual(readJson(c.stateFile).status, 'budget_exhausted');
+  assert.strictEqual(claudeCalls(c).length, 0, 'a zero cap spends nothing at all');
+  // capabilities override must not probe (would take ~a minute)
+  const t = Date.now();
+  detectCapabilities({ refresh: true, override: { git: { available: true, authed: true, account: null, detail: 'x' } } });
+  assert.ok(Date.now() - t < 2000, 'an override short-circuits probing');
+});
+
 // ---------------------------------------------------------------- review regressions
 test('the .pcr mailbox never reaches a commit, even if the builder clobbers .gitignore', () => {
   const c = setupCase('pcr-guard', {
