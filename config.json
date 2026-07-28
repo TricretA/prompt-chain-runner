@@ -2,14 +2,37 @@
   "claude_command": "claude",
   "claude_args": [],
   "claude_timeout_ms": 3600000,
+  "planner_timeout_ms": 900000,
   "tester_timeout_ms": 1200000,
-  "max_retries": 4,
+  "debugger_timeout_ms": 1200000,
+  "design_timeout_ms": 1800000,
+  "security_timeout_ms": 900000,
+  "max_retries": 5,
+  "on_stuck": "continue",
   "stop_on_first_failure": false,
   "output_capture_limit": 20000,
   "fix_prompt_output_limit": 8000,
   "verify_timeout_ms": 600000,
   "dashboard_port": 4747,
   "tester": { "enabled": true },
-  "deploy": { "enabled": true, "visibility": "public", "verify_live": true, "live_timeout_ms": 900000 },
-  "notify": { "enabled": true }
+  "design": { "enabled": true, "rounds": 1 },
+  "security": { "enabled": true, "block_deploy": true, "max_fix_rounds": 2 },
+  "lessons": { "enabled": true },
+  "budget": { "max_usd_per_run": 40 },
+  "deploy": {
+    "enabled": true,
+    "target": "auto",
+    "visibility": "public",
+    "verify_live": true,
+    "live_timeout_ms": 900000
+  },
+  "notify": {
+    "enabled": true,
+    "ntfy": { "topic": "" },
+    "telegram": { "bot_token": "", "chat_id": "" },
+    "discord": { "webhook_url": "" },
+    "slack": { "webhook_url": "" },
+    "webhook": { "url": "" }
+  },
+  "watchdog": { "enabled": true, "heartbeat_stale_ms": 2700000 }
 }

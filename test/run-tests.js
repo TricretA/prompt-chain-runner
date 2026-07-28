@@ -45,6 +45,9 @@ function setupCase(name, { phases, calls, queueExtra = {}, config = {} }) {
   const project = path.join(dir, 'target');
   fs.mkdirSync(project, { recursive: true });
   fs.writeFileSync(path.join(project, 'mock-scenario.json'), JSON.stringify({ calls }, null, 2));
+  // The mock CLI's own bookkeeping lives in the project dir; it is test
+  // scaffolding, not project content, so it must not look like an agent edit.
+  fs.writeFileSync(path.join(project, '.gitignore'), 'mock-scenario.json\nmock-state.json\nmock-prompts.jsonl\n');
 
   const queueFile = path.join(dir, 'queue.json');
   fs.writeFileSync(queueFile, JSON.stringify({ project_path: project, phases, ...queueExtra }, null, 2));
@@ -54,9 +57,25 @@ function setupCase(name, { phases, calls, queueExtra = {}, config = {} }) {
     claude_command: ['node', MOCK],
     claude_timeout_ms: 30000,
     max_retries: 2,
+    on_stuck: 'halt',
+    // Probing real CLIs costs ~a minute per process; the suite asserts on the
+    // orchestrator, not on this machine's installed tooling.
+    capabilities: {
+      override: {
+        github: { available: true, authed: true, account: 'test-user', detail: 'gh (test override)' },
+        vercel: { available: false, authed: false, account: null, detail: 'not installed (test override)' },
+        netlify: { available: false, authed: false, account: null, detail: 'not installed (test override)' },
+        supabase: { available: false, authed: false, account: null, detail: 'not installed (test override)' },
+        playwright: { available: true, authed: true, account: null, detail: 'chromium cached (test override)' },
+        git: { available: true, authed: true, account: null, detail: 'git (test override)' },
+      },
+    },
     verify_timeout_ms: 30000,
     verification_steps: [{ name: 'check', command: `node "${CHECK}"` }],
     tester: { enabled: false },
+    design: { enabled: false },
+    security: { enabled: false },
+    lessons: { enabled: false },
     deploy: { enabled: false },
     notify: { enabled: false },
     ...config,
@@ -67,6 +86,7 @@ function setupCase(name, { phases, calls, queueExtra = {}, config = {} }) {
     project,
     queueFile,
     configFile,
+    backlogFile: path.join(dir, 'backlog.json'),
     stateFile: path.join(dir, 'state.json'),
     logsDir: path.join(dir, 'logs'),
   };
@@ -79,8 +99,9 @@ function runRunner(c, extraArgs = []) {
     '--config', c.configFile,
     '--logs', c.logsDir,
     '--state', c.stateFile,
+    '--backlog', c.backlogFile,
     ...extraArgs,
-  ], { encoding: 'utf8', timeout: 120000 });
+  ], { encoding: 'utf8', timeout: 180000 });
 }
 
 function claudeCalls(c) {
@@ -539,6 +560,331 @@ test('unit: waitUntilLive succeeds against a real local server', async () => {
   } finally {
     server.close();
   }
+});
+
+// ---------------------------------------------------------------- v3: planner
+test('planner: a one-line brief becomes the whole prompt chain, then gets built', () => {
+  const c = setupCase('planner', {
+    phases: [],
+    queueExtra: { brief: 'A one page site for a bakery', project_name: 'bakery' },
+    calls: [
+      { files: { '.pcr/plan.json': JSON.stringify({
+        project_name: 'bakery', stack: 'static HTML/CSS/JS', deploy_target: 'github-pages',
+        context: 'A warm bakery site. Static, no framework.',
+        prompts: [{ title: 'scaffold', prompt: 'create index.html saying GOOD' }, { title: 'polish', prompt: 'keep it GOOD, add styles' }],
+      }) } },
+      { files: { 'app.txt': 'GOOD 1' } },
+      { files: { 'app.txt': 'GOOD 2' } },
+    ],
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+
+  const queue = readJson(c.queueFile);
+  assert.strictEqual(queue.phases.length, 2, 'the plan became the queue');
+  assert.strictEqual(queue.phases[0].title, 'scaffold');
+  assert.strictEqual(queue.phases[0].status, 'passed');
+  assert.strictEqual(queue.phases[1].status, 'passed');
+  assert.match(queue.context, /warm bakery/, 'planner context saved as shared context');
+
+  const calls = claudeCalls(c);
+  assert.strictEqual(calls.length, 3, 'planner + 2 builders');
+  assert.match(calls[0].prompt, /PLANNER agent/, 'first call is the planner');
+  assert.match(calls[0].prompt, /A one page site for a bakery/, 'planner sees the brief');
+  assert.match(calls[1].prompt, /create index\.html saying GOOD/, 'builder gets the planned prompt');
+  assert.match(calls[1].prompt, /warm bakery/, 'builder gets the planned context');
+  assert.strictEqual(gitLog(c).length, 2);
+});
+
+test('planner: an unusable plan halts instead of building nothing', () => {
+  const c = setupCase('planner-bad', {
+    phases: [],
+    queueExtra: { brief: 'something', project_name: 'x' },
+    calls: [{ result: 'I could not plan this' }],
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 2, `expected exit 2, got ${res.status}`);
+  assert.match(readJson(c.stateFile).message, /Planner/i);
+});
+
+// ---------------------------------------------------------------- v3: escalation ladder
+test('escalation: repeated failures reach the Debugger, then a revert and a fresh start', () => {
+  const c = setupCase('escalation', {
+    phases: [{ id: 'p1', prompt: 'first task' }, { id: 'p2', prompt: 'the hard one' }],
+    calls: [
+      { files: { 'app.txt': 'GOOD base' } },          // p1 builder — passes, gives us a good commit
+      { files: { 'app.txt': 'BAD 1' } },              // p2 attempt 1
+      { files: { 'app.txt': 'BAD 2' } },              // attempt 2 (fix)
+      { files: { 'app.txt': 'BAD 3' } },              // attempt 3 (lessons)
+      { files: { '.pcr/diagnosis.json': JSON.stringify({
+        root_cause: 'the check wants the literal word GOOD',
+        why_previous_fixes_failed: 'they only reworded BAD',
+        exact_change_needed: 'write GOOD into app.txt',
+        files_to_change: ['app.txt'], confidence: 'high',
+      }) } },                                          // attempt 4 -> debugger runs first
+      { files: { 'app.txt': 'BAD 4' } },              // attempt 4 builder (diagnosis)
+      { files: { 'app.txt': 'GOOD at last' } },       // attempt 5 (fresh_start)
+    ],
+    config: { max_retries: 4 },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+
+  const calls = claudeCalls(c);
+  const debuggerCall = calls.find((x) => /DEBUGGER agent/.test(x.prompt));
+  assert.ok(debuggerCall, 'the Debugger agent was reached');
+  assert.match(debuggerCall.prompt, /DIAGNOSIS ONLY/, 'debugger is told not to edit');
+  assert.match(debuggerCall.prompt, /attempt 1/, 'debugger sees the attempt history');
+
+  const withDiagnosis = calls.find((x) => /DEBUGGER agent investigated/.test(x.prompt));
+  assert.ok(withDiagnosis, 'the root cause was handed to the builder');
+  assert.match(withDiagnosis.prompt, /the check wants the literal word GOOD/);
+
+  const fresh = calls.find((x) => /REVERTED to the last known-good commit/.test(x.prompt));
+  assert.ok(fresh, 'the fresh-start prompt was sent after the revert');
+  assert.match(fresh.prompt, /do NOT repeat these approaches/i);
+
+  const events = runEvents(c);
+  assert.ok(events.some((e) => e.type === 'diagnosis'), 'diagnosis event logged');
+  const revert = events.find((e) => e.type === 'revert');
+  assert.ok(revert && revert.ok, 'the tree was really reverted');
+  assert.strictEqual(readJson(c.queueFile).phases[1].status, 'passed');
+});
+
+test('hands-free: an unfixable prompt is marked degraded and the run keeps going', () => {
+  const c = setupCase('degraded', {
+    phases: [{ id: 'p1', prompt: 'impossible' }, { id: 'p2', prompt: 'still fine' }],
+    calls: [
+      { files: { 'app.txt': 'BAD forever' } }, { files: { 'app.txt': 'BAD forever' } }, { files: { 'app.txt': 'BAD forever' } },
+      { files: { 'app.txt': 'GOOD now' } },
+    ],
+    config: { on_stuck: 'continue', max_retries: 2 },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0 (kept going), got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  const queue = readJson(c.queueFile);
+  assert.strictEqual(queue.phases[0].status, 'degraded', 'the impossible prompt is recorded as degraded');
+  assert.strictEqual(queue.phases[1].status, 'passed', 'the run continued to the next prompt');
+  const state = readJson(c.stateFile);
+  assert.strictEqual(state.status, 'passed_with_issues');
+  assert.match(state.message, /could not be completed/i, 'the summary is honest about what failed');
+  assert.ok(runEvents(c).some((e) => e.type === 'phase_degraded'));
+});
+
+// ---------------------------------------------------------------- v3: regression criteria
+test('the tester re-checks acceptance criteria from earlier prompts', () => {
+  const c = setupCase('regression', {
+    phases: [{ id: 'p1', prompt: 'build the lightbox' }, { id: 'p2', prompt: 'add the footer' }],
+    calls: [
+      { files: { 'app.txt': 'GOOD' } },
+      { files: { '.pcr/verdict.json': JSON.stringify({ pass: true, summary: 'lightbox works', criteria: ['clicking an image opens the lightbox'] }) } },
+      { files: { 'app.txt': 'GOOD 2' } },
+      { files: { '.pcr/verdict.json': JSON.stringify({ pass: true, summary: 'footer fine', criteria: ['footer shows the year'] }) } },
+    ],
+    config: { tester: { enabled: true } },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  const calls = claudeCalls(c);
+  assert.ok(!/clicking an image/.test(calls[1].prompt), 'the first tester has no earlier criteria to re-check');
+  assert.match(calls[3].prompt, /clicking an image opens the lightbox/, 'the second tester re-checks the first prompt criteria');
+  assert.match(calls[3].prompt, /must not have broken them/i);
+  assert.deepStrictEqual(readJson(c.queueFile).phases[0].criteria, ['clicking an image opens the lightbox'], 'criteria persist for resumes');
+});
+
+// ---------------------------------------------------------------- v3: design + security
+test('design: the Designer runs after the build and its changes are committed', () => {
+  const c = setupCase('design', {
+    phases: [{ id: 'p1', prompt: 'build it' }],
+    calls: [
+      { files: { 'app.txt': 'GOOD' } },
+      { files: { 'style.css': 'body{}', '.pcr/design.json': JSON.stringify({
+        score_before: 5, score_after: 8, issues_found: ['cramped spacing at 360px'],
+        changes_made: ['increased section padding'], remaining_issues: [], verified_in_pixels: true,
+      }) } },
+    ],
+    config: { design: { enabled: true, rounds: 1 } },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  const calls = claudeCalls(c);
+  assert.match(calls[1].prompt, /DESIGN agent/, 'the designer ran');
+  assert.match(calls[1].prompt, /ACTUALLY LOOK at the screenshot/i, 'told to view the pixels');
+  assert.match(calls[1].prompt, /360px/, 'told which widths to check');
+  const log = gitLog(c);
+  assert.strictEqual(log.length, 2, `design changes get their own commit:\n${log.join('\n')}`);
+  assert.match(log[0], /design review round 1/);
+});
+
+test('design: changes that break the checks are rolled back, not shipped', () => {
+  const c = setupCase('design-revert', {
+    phases: [{ id: 'p1', prompt: 'build it' }],
+    calls: [
+      { files: { 'app.txt': 'GOOD' } },
+      { files: { 'app.txt': 'BAD after redesign', '.pcr/design.json': JSON.stringify({ score_before: 4, score_after: 9, changes_made: ['rewrote everything'], remaining_issues: [] }) } },
+    ],
+    config: { design: { enabled: true, rounds: 1 } },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  assert.strictEqual(fs.readFileSync(path.join(c.project, 'app.txt'), 'utf8'), 'GOOD', 'the breaking redesign was reverted');
+  assert.strictEqual(gitLog(c).length, 1, 'nothing extra committed');
+  assert.ok(runEvents(c).some((e) => e.type === 'design_reverted'));
+});
+
+test('security: a critical finding blocks the deploy until it is fixed', () => {
+  const c = setupCase('security', {
+    phases: [{ id: 'p1', prompt: 'build it' }],
+    calls: [
+      { files: { 'app.txt': 'GOOD' } },
+      { files: { '.pcr/security.json': JSON.stringify({
+        pass: false, summary: 'AWS key committed',
+        critical: [{ what: 'AWS secret key in config.js', where: 'config.js:3', fix: 'remove it and purge history' }],
+        warnings: [], changes_made: [],
+      }) } },                                          // audit 1 — blocks
+      { files: { 'app.txt': 'GOOD cleaned' } },        // builder repairs it
+      { files: { '.pcr/security.json': JSON.stringify({ pass: true, summary: 'clean', critical: [], warnings: [], changes_made: [] }) } },
+      { files: { '.pcr/deploy.json': JSON.stringify({ target: 'github-pages', repo_url: 'https://github.com/x/y', pages_url: 'https://x.github.io/y/', live: true }) } },
+    ],
+    config: { security: { enabled: true, block_deploy: true, max_fix_rounds: 2 }, deploy: { enabled: true, verify_live: false, target: 'github-pages' } },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  const calls = claudeCalls(c);
+  assert.match(calls[1].prompt, /SECURITY agent/, 'security agent ran before deploy');
+  assert.match(calls[2].prompt, /SECURITY agent blocked its release/, 'the finding went back to a builder');
+  assert.match(calls[2].prompt, /AWS secret key in config\.js/, 'with the specific finding');
+  assert.match(calls[4].prompt, /DEPLOYER agent/, 'deploy only happened after the re-audit passed');
+  assert.strictEqual(readJson(c.stateFile).deploy.status, 'live');
+});
+
+test('security: an unfixed critical finding stops publication entirely', () => {
+  const c = setupCase('security-block', {
+    phases: [{ id: 'p1', prompt: 'build it' }],
+    calls: [
+      { files: { 'app.txt': 'GOOD' } },
+      { files: { '.pcr/security.json': JSON.stringify({
+        pass: false, summary: 'private key in repo',
+        critical: [{ what: 'id_rsa committed', where: 'keys/id_rsa', fix: 'remove' }], warnings: [], changes_made: [],
+      }) } },
+    ],
+    config: { security: { enabled: true, block_deploy: true, max_fix_rounds: 0 }, deploy: { enabled: true, verify_live: false, target: 'github-pages' } },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 2, `expected exit 2 (blocked), got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  assert.ok(!claudeCalls(c).some((x) => /DEPLOYER agent/.test(x.prompt)), 'the deployer was never invoked');
+  assert.match(readJson(c.stateFile).message, /security/i);
+});
+
+// ---------------------------------------------------------------- v3: budget + backlog
+test('budget: the run halts at the cap instead of burning money unattended', () => {
+  const c = setupCase('budget', {
+    phases: [{ id: 'p1', prompt: 'a' }, { id: 'p2', prompt: 'b' }, { id: 'p3', prompt: 'c' }],
+    calls: [{ files: { 'app.txt': 'GOOD' } }],
+    // the mock reports $0.01 per call, so a $0.015 cap allows exactly two
+    config: { budget: { max_usd_per_run: 0.015 } },
+  });
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 2, `expected exit 2, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+  const state = readJson(c.stateFile);
+  assert.strictEqual(state.status, 'budget_exhausted');
+  assert.match(state.message, /Budget cap/);
+  assert.ok(claudeCalls(c).length <= 2, `stopped at the cap, made ${claudeCalls(c).length} calls`);
+  assert.ok(runEvents(c).some((e) => e.type === 'budget_exhausted'));
+});
+
+test('backlog: the next queued project is built in the same run, unattended', () => {
+  const c = setupCase('backlog', {
+    phases: [{ id: 'p1', prompt: 'first project' }],
+    calls: [{ files: { 'app.txt': 'GOOD' } }],
+  });
+  const second = path.join(c.dir, 'second-project');
+  fs.mkdirSync(second, { recursive: true });
+  fs.writeFileSync(path.join(second, 'mock-scenario.json'), JSON.stringify({ calls: [{ files: { 'app.txt': 'GOOD two' } }] }));
+  fs.writeFileSync(path.join(second, '.gitignore'), 'mock-scenario.json\nmock-state.json\nmock-prompts.jsonl\n');
+  fs.writeFileSync(c.backlogFile, JSON.stringify({
+    items: [{
+      id: 'proj-second', project_name: 'second', brief: null,
+      // Pinned so the test controls where it builds (relative paths resolve
+      // against the runner root, not the scratch dir).
+      project_path: second,
+      prompts: [{ title: 'only step', prompt: 'build the second thing' }],
+      context: '', deploy: { enabled: false, target: 'auto', repo_name: 'second' },
+      status: 'pending', added_at: new Date().toISOString(), started_at: null, finished_at: null, result: null,
+    }],
+  }, null, 2));
+
+  const res = runRunner(c);
+  assert.strictEqual(res.status, 0, `expected exit 0, got ${res.status}\n${res.stdout}\n${res.stderr}`);
+
+  const backlog = readJson(c.backlogFile).items;
+  assert.strictEqual(backlog[0].status, 'done', 'the backlog item was completed');
+  assert.ok(backlog[0].finished_at, 'completion timestamped');
+  const queue = readJson(c.queueFile);
+  assert.strictEqual(queue.project_name, 'second', 'the backlog project became the active queue');
+  assert.strictEqual(queue.phases[0].status, 'passed');
+  assert.ok(runEvents(c).filter((e) => e.type === 'project_start').length >= 2, 'two projects started in one run');
+});
+
+// ---------------------------------------------------------------- v3: deploy targets + deep live check
+test('deploy: the target picks the right platform instructions', () => {
+  const { deployerPrompt } = require('../lib/agents');
+  const gh = deployerPrompt({ projectName: 'p', repoName: 'r', visibility: 'public', target: 'github-pages', capabilities: '' });
+  assert.match(gh, /gh CLI/);
+  assert.match(gh, /sub-path/, 'warns about the base-path trap');
+  const vc = deployerPrompt({ projectName: 'p', repoName: 'r', target: 'vercel', capabilities: '' });
+  assert.match(vc, /vercel --prod --yes/);
+  assert.match(vc, /Vercel MCP server is also connected/);
+  const nl = deployerPrompt({ projectName: 'p', repoName: 'r', target: 'netlify', capabilities: '' });
+  assert.match(nl, /netlify-cli deploy --prod/);
+  for (const p of [gh, vc, nl]) assert.match(p, /assets load/, 'every target must prove assets load');
+});
+
+test('live check: a page whose own assets 404 is not live', async () => {
+  const { verifyDeployment } = require('../lib/live-check');
+  const server = http.createServer((req, res) => {
+    if (req.url === '/') {
+      res.writeHead(200, { 'Content-Type': 'text/html' });
+      return res.end('<html><head><link rel="stylesheet" href="/css/app.css"></head><body><script src="/js/app.js"></script></body></html>');
+    }
+    if (req.url === '/js/app.js') { res.writeHead(200); return res.end('console.log(1)'); }
+    res.writeHead(404); res.end('not found');
+  });
+  await new Promise((r) => server.listen(0, '127.0.0.1', r));
+  const base = `http://127.0.0.1:${server.address().port}/`;
+  try {
+    const broken = await verifyDeployment(base);
+    assert.strictEqual(broken.ok, false, 'a 404 stylesheet means the deploy is broken');
+    assert.match(broken.evidence, /app\.css/);
+    assert.match(broken.evidence, /base-path/i, 'explains the usual cause');
+    const shallow = await verifyDeployment(base, { checkAssets: false });
+    assert.strictEqual(shallow.ok, true, 'asset checking can be turned off');
+  } finally {
+    server.close();
+  }
+});
+
+// ---------------------------------------------------------------- v3: lessons
+test('lessons: a fix that worked is remembered and offered on the next failure', () => {
+  const { recordLesson, findLessons, formatLessons } = require('../lib/lessons');
+  const file = path.join(TMP, 'lessons', 'lessons.jsonl');
+  rmrf(path.dirname(file));
+  recordLesson(file, {
+    project: 'a', phase: 'p1', agent: 'builder',
+    error: "TypeError: Cannot read properties of undefined (reading 'map') at src/list.js:42:11",
+    fix: 'guard the array before mapping',
+  });
+  recordLesson(file, {
+    project: 'b', phase: 'p2', agent: 'builder',
+    error: 'ENOENT: no such file or directory, open /tmp/other/thing.json',
+    fix: 'create the directory first',
+  });
+  const hits = findLessons(file, "TypeError: Cannot read properties of undefined (reading 'map') at web/app.js:7:3", 3);
+  assert.ok(hits.length >= 1, 'the same class of error matches across projects and paths');
+  assert.match(hits[0].fix, /guard the array/);
+  const block = formatLessons(hits);
+  assert.match(block, /Lessons from earlier runs/);
+  assert.strictEqual(formatLessons([]), '', 'no block when there is nothing to say');
 });
 
 // ---------------------------------------------------------------- review regressions

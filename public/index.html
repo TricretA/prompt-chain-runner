@@ -124,6 +124,7 @@
   .chip.passed .dot, .chip.live .dot { background: var(--good); }
   .chip.failed_retry .dot, .chip.deploying .dot { background: var(--warning); }
   .chip.stuck .dot, .chip.failed .dot { background: var(--critical); }
+  .chip.degraded .dot { background: var(--serious); }
   .chip .n { color: var(--muted); font-weight: 400; }
   .arrow { color: var(--muted); }
 
@@ -221,15 +222,20 @@
       <div class="tile"><div class="k">Progress</div><div class="v" id="tProgress">—</div><div class="s">prompts passed</div></div>
       <div class="tile"><div class="k">Elapsed</div><div class="v" id="tElapsed">—</div><div class="s" id="tStarted"></div></div>
       <div class="tile"><div class="k">Cost</div><div class="v" id="tCost">—</div><div class="s" id="tCalls"></div></div>
+      <div class="tile"><div class="k">Queue</div><div class="v" id="tBacklog">—</div><div class="s" id="tStage"></div></div>
     </div>
 
     <div class="card">
       <h2>The company</h2>
       <div class="agents">
         <div class="agent" id="ag-orchestrator"><div class="name"><span class="dot"></span>Orchestrator</div><div class="role">routes work, verifies, commits</div><div class="doing"></div></div>
+        <div class="agent" id="ag-planner"><div class="name"><span class="dot"></span>Planner</div><div class="role">turns a brief into the plan</div><div class="doing"></div></div>
         <div class="agent" id="ag-builder"><div class="name"><span class="dot"></span>Builder</div><div class="role">writes the code</div><div class="doing"></div></div>
         <div class="agent" id="ag-tester"><div class="name"><span class="dot"></span>Tester</div><div class="role">verifies every claim</div><div class="doing"></div></div>
-        <div class="agent" id="ag-deployer"><div class="name"><span class="dot"></span>Deployer</div><div class="role">ships to GitHub Pages</div><div class="doing"></div></div>
+        <div class="agent" id="ag-debugger"><div class="name"><span class="dot"></span>Debugger</div><div class="role">finds root causes when fixes stall</div><div class="doing"></div></div>
+        <div class="agent" id="ag-designer"><div class="name"><span class="dot"></span>Designer</div><div class="role">looks at screenshots, fixes ugly</div><div class="doing"></div></div>
+        <div class="agent" id="ag-security"><div class="name"><span class="dot"></span>Security</div><div class="role">gate before anything goes public</div><div class="doing"></div></div>
+        <div class="agent" id="ag-deployer"><div class="name"><span class="dot"></span>Deployer</div><div class="role">ships it live</div><div class="doing"></div></div>
       </div>
     </div>
 
@@ -247,7 +253,39 @@
   <!-- ================= PROMPTS ================= -->
   <section class="tab" id="tab-prompts">
     <div class="card">
-      <h2>1 · Import your prompt file</h2>
+      <h2>Fastest way · describe it in one line</h2>
+      <div class="row2">
+        <div>
+          <label class="lbl">Project name</label>
+          <input type="text" id="planName" placeholder="bakery-site">
+          <label class="lbl">Deploy to</label>
+          <select id="planTarget">
+            <option value="auto">Auto (best available)</option>
+            <option value="github-pages">GitHub Pages</option>
+            <option value="vercel">Vercel</option>
+            <option value="netlify">Netlify</option>
+          </select>
+        </div>
+        <div>
+          <label class="lbl">What do you want built?</label>
+          <textarea id="planBrief" placeholder="A one-page site for a family bakery in Nairobi — menu, gallery, opening hours, and a WhatsApp order button. Warm and simple."></textarea>
+        </div>
+      </div>
+      <div class="savebar">
+        <button class="btn primary" id="btnPlan">Plan &amp; build it</button>
+        <button class="btn" id="btnPlanQueue">Add to backlog</button>
+        <span class="note" id="planNote"></span>
+      </div>
+      <div class="hint">The Planner agent writes the whole prompt chain itself, then the company builds, tests, designs, security-checks and deploys it. You get one notification when it's live.</div>
+    </div>
+
+    <div class="card">
+      <h2>Backlog · projects queued after this one</h2>
+      <div id="backlogList" class="empty">Nothing queued.</div>
+    </div>
+
+    <div class="card">
+      <h2>Or · import your own prompt file</h2>
       <div class="row2">
         <div>
           <label class="lbl">Project name</label>
@@ -432,11 +470,16 @@ function render() {
     $('tStarted').textContent = 'started ' + fmtTime(st.started_at);
   } else { $('tElapsed').textContent = '—'; $('tStarted').textContent = ''; }
   $('tCost').textContent = st?.totals ? '$' + (st.totals.cost_usd ?? 0).toFixed(2) : '—';
-  $('tCalls').textContent = st?.totals ? `${st.totals.claude_calls} agent calls` : '';
+  $('tCalls').textContent = st?.totals
+    ? `${st.totals.claude_calls} agent calls${st.budget?.cap_usd ? ` · cap $${st.budget.cap_usd}` : ''}`
+    : '';
+  const bl = overview?.backlog_summary;
+  $('tBacklog').textContent = bl ? String(bl.pending ?? 0) : '0';
+  $('tStage').textContent = st?.stage ? `stage: ${st.stage}` : 'projects waiting';
 
   /* agents */
   const activeAgent = (status === 'running') ? (st?.activity?.agent || null) : null;
-  for (const name of ['orchestrator', 'builder', 'tester', 'deployer']) {
+  for (const name of ['orchestrator', 'planner', 'builder', 'tester', 'debugger', 'designer', 'security', 'deployer']) {
     const el = $('ag-' + name);
     const isActive = activeAgent === name || (name === 'orchestrator' && status === 'running');
     el.classList.toggle('active', isActive);
@@ -453,7 +496,7 @@ function render() {
   } else {
     phases.forEach((p, i) => {
       if (i) pipe.append(h('span', { class: 'arrow', text: '→' }));
-      const stTxt = { pending: 'queued', running: 'building', passed: 'passed', failed_retry: 'fixing', stuck: 'STUCK' }[p.status] || p.status;
+      const stTxt = { pending: 'queued', running: 'building', passed: 'passed', failed_retry: 'fixing', stuck: 'STUCK', degraded: 'UNFINISHED' }[p.status] || p.status;
       const chip = h('span', { class: 'chip ' + p.status, title: `${p.title || p.id} — ${stTxt}${p.retries ? `, ${p.retries} retr${p.retries > 1 ? 'ies' : 'y'}` : ''}` },
         h('span', { class: 'dot' }),
         h('span', { class: 'txt', text: p.title || p.id }),
@@ -473,7 +516,7 @@ function render() {
   /* banners */
   const live = $('bannerLive'), dead = $('bannerDead');
   live.className = 'banner live'; dead.className = 'banner dead';
-  if (st?.status === 'passed_all') {
+  if (st?.status === 'passed_all' || st?.status === 'passed_with_issues') {
     live.replaceChildren(
       h('div', { class: 'big', text: '✅ ' + (st.project_name || 'Project') + ' — finished, tested' + (st.deploy?.pages_url ? ' and LIVE' : '') }),
       st.deploy?.pages_url ? h('div', {}, 'Live site: ', linkOrText(st.deploy.pages_url)) : null,
@@ -518,6 +561,7 @@ function render() {
   else if (nearBottom) feed.scrollTop = feed.scrollHeight;
 
   renderSavedQueue();
+  renderBacklog();
 }
 
 /* ---------------- header actions */
@@ -531,6 +575,59 @@ $('btnStop').addEventListener('click', () => api('/api/run/stop', {}));
 $('btnKill').addEventListener('click', () => {
   if (confirm('Kill the runner and its in-flight Claude session immediately?')) api('/api/run/kill', {});
 });
+
+/* ================= PLANNER + BACKLOG ================= */
+function planBody() {
+  return {
+    project_name: $('planName').value.trim(),
+    brief: $('planBrief').value.trim(),
+    deploy: { enabled: true, target: $('planTarget').value },
+  };
+}
+
+$('btnPlan').addEventListener('click', async () => {
+  const note = $('planNote');
+  const body = planBody();
+  if (!body.brief) { note.className = 'note'; note.textContent = 'Describe what you want built first.'; return; }
+  note.className = 'note';
+  note.textContent = 'Planning…';
+  const r = await api('/api/plan', { ...body, start: true });
+  if (r.data?.ok) {
+    note.className = 'note ok';
+    note.textContent = 'Planner is writing the prompt chain — watch the Live tab.';
+    document.querySelector('nav button[data-tab=live]').click();
+  } else {
+    note.textContent = r.data?.error || 'Could not start.';
+  }
+});
+
+$('btnPlanQueue').addEventListener('click', async () => {
+  const note = $('planNote');
+  const body = planBody();
+  if (!body.brief) { note.className = 'note'; note.textContent = 'Describe what you want built first.'; return; }
+  if (!body.project_name) body.project_name = body.brief.slice(0, 40);
+  const r = await api('/api/backlog', body);
+  note.className = 'note' + (r.data?.ok ? ' ok' : '');
+  note.textContent = r.data?.ok ? 'Added to the backlog — it builds after the current project.' : (r.data?.error || 'Could not queue it.');
+  if (r.data?.ok) { $('planBrief').value = ''; $('planName').value = ''; }
+});
+
+function renderBacklog() {
+  const items = overview?.backlog || [];
+  const box = $('backlogList');
+  const pending = items.filter((i) => i.status === 'pending' || i.status === 'running');
+  if (!pending.length) { box.className = 'empty'; box.textContent = 'Nothing queued.'; return; }
+  box.className = '';
+  box.replaceChildren(...pending.map((i) => h('div', { class: 'prompt-item' },
+    h('div', { class: 'head' },
+      h('span', { class: 'chip ' + (i.status === 'running' ? 'running' : 'pending') }, h('span', { class: 'dot' }), h('span', { class: 'st', text: i.status })),
+      h('strong', { style: 'flex:1', text: i.project_name }),
+      h('button', {
+        class: 'icon-btn', title: 'remove', text: '✕',
+        onclick: async () => { await api('/api/backlog/remove', { id: i.id }); poll(); },
+      })),
+    h('div', { style: 'color: var(--ink-2); font-size:13px; margin-top:6px', text: i.brief || `${(i.prompts || []).length} written prompts` }))));
+}
 
 /* ================= PROMPTS tab ================= */
 let draft = null; // { context, prompts: [{title, prompt}] }
@@ -733,6 +830,18 @@ function renderEvent(ev) {
     case 'commit': el.classList.add('good'); sum(`commit ${String(ev.hash || '').slice(0, 10)}`); break;
     case 'phase_passed': el.classList.add('good'); sum(`phase passed after ${ev.retries} retr${ev.retries === 1 ? 'y' : 'ies'}`); break;
     case 'phase_stuck': el.classList.add('bad'); sum(`STUCK after ${ev.retries} attempts (${ev.reason})`); break;
+    case 'phase_degraded': el.classList.add('bad'); sum(`gave up after ${ev.retries} attempts (${ev.reason}) — kept going`); break;
+    case 'diagnosis': sum(`debugger: ${ev.diagnosis?.root_cause ? String(ev.diagnosis.root_cause).slice(0, 200) : 'no diagnosis'}`); if (ev.diagnosis) el.append(det('full diagnosis', pre(JSON.stringify(ev.diagnosis, null, 2)))); break;
+    case 'revert': el.classList.add('bad'); sum(`reverted to ${String(ev.commit || '').slice(0, 8)} for a fresh attempt`); break;
+    case 'design_result': sum(`design ${ev.design?.score_before ?? '?'}→${ev.design?.score_after ?? '?'}/10, ${(ev.design?.changes_made || []).length} change(s)`); if (ev.design) el.append(det('design report', pre(JSON.stringify(ev.design, null, 2)))); break;
+    case 'design_reverted': el.classList.add('bad'); sum(`design changes broke ${(ev.failed_steps || []).join(', ')} — rolled back`); break;
+    case 'security_result': el.classList.add(ev.security?.pass ? 'good' : 'bad'); sum(`security: ${ev.security?.pass ? 'PASS' : 'BLOCKED'} — ${ev.security?.summary || ''}`); if (ev.security) el.append(det('security report', pre(JSON.stringify(ev.security, null, 2)))); break;
+    case 'lessons_used': sum('injected lessons from earlier runs'); break;
+    case 'tester_modified_tree': el.classList.add('bad'); sum('tester changed project files — verdict voided'); break;
+    case 'budget_exhausted': el.classList.add('bad'); sum(`budget cap reached: $${ev.spent} of $${ev.cap} at ${ev.where}`); break;
+    case 'project_start': sum(`project ${ev.project} — ${(ev.phases || []).length} prompts`); break;
+    case 'deploy_skipped': sum(`deploy skipped — already live at ${ev.pages_url}`); break;
+    case 'deploy_unavailable': el.classList.add('bad'); sum(ev.evidence || 'no deploy platform available'); break;
     case 'agent_msg': sum(`${ev.from} → ${ev.to}: ${ev.text}`); break;
     case 'deploy_start': sum(`deploying to GitHub repo "${ev.repo_name}"`); break;
     case 'live_check_start': sum(`orchestrator polling ${ev.url}`); break;

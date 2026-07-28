@@ -17,6 +17,9 @@ const { readJson, atomicWriteJson, slugify, pidAlive, pidLooksLikeNode } = requi
 const { readState, writeState } = require('./lib/state');
 const { killTree } = require('./lib/claude');
 const { parsePrompts } = require('./lib/parse-prompts');
+const { loadBacklog, addProject, markStatus, summarize } = require('./lib/backlog');
+const { detectCapabilities, describeCapabilities } = require('./lib/capabilities');
+const { channelsConfigured } = require('./lib/remote-notify');
 
 function parseArgs(argv) {
   const opts = { port: null, open: false, root: null };
@@ -33,6 +36,7 @@ const DATA_ROOT = parseArgs(process.argv.slice(2)).root || ROOT;
 const LOGS_DIR = path.join(DATA_ROOT, 'logs');
 const STATE_FILE = path.join(DATA_ROOT, 'state.json');
 const QUEUE_FILE = path.join(DATA_ROOT, 'prompts', 'queue.json');
+const BACKLOG_FILE = path.join(DATA_ROOT, 'prompts', 'backlog.json');
 const CONFIG_FILE = path.join(DATA_ROOT, 'config.json');
 const STOP_FILE = path.join(DATA_ROOT, '.stop');
 const INDEX_FILE = path.join(ROOT, 'public', 'index.html');
@@ -150,6 +154,7 @@ function startRunner({ retryStuck = false } = {}) {
     '--config', CONFIG_FILE,
     '--logs', LOGS_DIR,
     '--state', STATE_FILE,
+    '--backlog', BACKLOG_FILE,
   ];
   if (retryStuck) args.push('--retry-stuck');
   // Early crashes (bad config/queue) happen before the runner opens its own
@@ -175,19 +180,162 @@ function startRunner({ retryStuck = false } = {}) {
   }
 }
 
+// Probing every CLI takes the better part of a minute, so it never happens in
+// a request path: the answer is computed once off the hot path at boot (and
+// refreshed hourly) and served from this variable meanwhile.
+let capabilitiesText = '';
+function refreshCapabilities() {
+  try {
+    const cfg = safeReadJson(CONFIG_FILE) || {};
+    capabilitiesText = describeCapabilities(detectCapabilities({
+      cacheFile: path.join(DATA_ROOT, '.capabilities.json'),
+      ttlMs: cfg.capabilities?.cache_ms,
+      override: cfg.capabilities?.override,
+    }));
+  } catch { /* the dashboard works fine without this label */ }
+}
+
+// --- Watchdog --------------------------------------------------------------
+// An unattended run must survive its own accidents: a runner killed by a
+// reboot, an OOM, or an agent session wedged forever. The dashboard is the
+// only always-on process, so it does the supervising. Restarts are capped so
+// a genuinely broken queue can't become an infinite respawn loop.
+const watchdogReport = { restarts: 0, last_restart: null, last_reason: null, disabled: false };
+const RESTART_WINDOW_MS = 60 * 60 * 1000;
+const MAX_RESTARTS_PER_WINDOW = 4;
+let restartTimes = [];
+
+function watchdogTick() {
+  const cfg = safeReadJson(CONFIG_FILE) || {};
+  if (cfg.watchdog?.enabled === false || watchdogReport.disabled) return;
+
+  const state = readState(STATE_FILE);
+  if (!state || state.status !== 'running') return; // nothing claims to be running
+  if (runnerIsActive()) {
+    // Alive — but is it making progress? A heartbeat that stops advancing means
+    // an agent session is wedged past any timeout that should have killed it.
+    const staleMs = cfg.watchdog?.heartbeat_stale_ms ?? 45 * 60 * 1000;
+    const beat = Date.parse(state.heartbeat || state.updated_at || 0);
+    if (!Number.isFinite(beat) || Date.now() - beat < staleMs) return;
+    restart(`no heartbeat for ${Math.round((Date.now() - beat) / 60000)} min — the run looks wedged`, state);
+    return;
+  }
+  restart('the runner process is gone but the run was never finished (crash or reboot)', state);
+}
+
+function restart(reason, state) {
+  restartTimes = restartTimes.filter((t) => Date.now() - t < RESTART_WINDOW_MS);
+  if (restartTimes.length >= MAX_RESTARTS_PER_WINDOW) {
+    watchdogReport.disabled = true;
+    watchdogReport.last_reason = `gave up: ${MAX_RESTARTS_PER_WINDOW} restarts in an hour (${reason})`;
+    console.error(`[watchdog] ${watchdogReport.last_reason}`);
+    return;
+  }
+  console.error(`[watchdog] restarting the runner: ${reason}`);
+
+  // A wedged runner still holds its pid, its Claude child, and the lock. Take
+  // all three down before starting a replacement, or the new one refuses.
+  if (state && pidAlive(state.pid) && pidLooksLikeNode(state.pid)) killTree(state.pid);
+  if (process.platform !== 'win32' && state?.claude_pid && pidAlive(state.claude_pid)) killTree(state.claude_pid);
+  try { fs.rmSync(path.join(DATA_ROOT, '.runner.lock'), { force: true }); } catch { /* ignore */ }
+  spawnedRunnerPid = null;
+  if (state) {
+    writeState(STATE_FILE, { ...state, status: 'stopped', message: `watchdog: ${reason}`, claude_pid: null });
+  }
+
+  // Resume: passed phases are skipped, and stuck/degraded ones get one more
+  // chance — the whole point is finishing without a human.
+  const started = startRunner({ retryStuck: true });
+  restartTimes.push(Date.now());
+  watchdogReport.restarts += 1;
+  watchdogReport.last_restart = new Date().toISOString();
+  watchdogReport.last_reason = started.ok ? reason : `${reason} (restart failed: ${started.error})`;
+}
+
 const routes = {
   'GET /api/overview': (req, res) => {
     const state = readState(STATE_FILE);
+    const cfg = safeReadJson(CONFIG_FILE) || {};
+    const backlog = loadBacklog(BACKLOG_FILE);
     json(res, 200, {
       now: new Date().toISOString(),
       state,
       runner_active: runnerIsActive(),
       stop_flag: fs.existsSync(STOP_FILE),
       queue: safeReadJson(QUEUE_FILE),
-      config: safeReadJson(CONFIG_FILE),
+      config: cfg,
+      backlog,
+      backlog_summary: summarize(backlog),
+      capabilities: capabilitiesText,
+      notify_channels: channelsConfigured(cfg.notify || {}),
+      watchdog: watchdogReport,
       runs: listRuns(),
       root: ROOT,
     });
+  },
+
+  // One line in, whole project out: the queue is written with only a brief and
+  // the Planner agent expands it into the prompt chain at run time.
+  'POST /api/plan': async (req, res) => {
+    const body = await readBody(req);
+    if (runnerIsActive()) {
+      return json(res, 409, { ok: false, error: 'A run is in progress — stop it or add this to the backlog instead.' });
+    }
+    const brief = String(body.brief ?? '').trim();
+    const projectName = String(body.project_name ?? '').trim() || slugify(brief.slice(0, 40), 'my-project');
+    if (!brief) return json(res, 400, { ok: false, error: 'Describe the project in one line first.' });
+    const slug = slugify(projectName, 'my-project');
+    const queue = {
+      project_name: projectName,
+      project_path: `./projects/${slug}`,
+      context: '',
+      brief,
+      deploy: {
+        enabled: body.deploy?.enabled !== false,
+        target: String(body.deploy?.target ?? 'auto'),
+        repo_name: String(body.deploy?.repo_name ?? '').trim() || slug,
+      },
+      phases: [],
+    };
+    fs.mkdirSync(path.dirname(QUEUE_FILE), { recursive: true });
+    atomicWriteJson(QUEUE_FILE, queue);
+    try { fs.rmSync(STATE_FILE, { force: true }); } catch { /* ignore */ }
+    const started = body.start === false ? { ok: true } : startRunner({});
+    json(res, started.ok ? 200 : 409, { ok: started.ok, queue, error: started.error });
+  },
+
+  'GET /api/backlog': (req, res) => {
+    const items = loadBacklog(BACKLOG_FILE);
+    json(res, 200, { items, summary: summarize(items) });
+  },
+
+  // Queue up another project to build after the current one, unattended.
+  'POST /api/backlog': async (req, res) => {
+    const body = await readBody(req);
+    try {
+      const item = addProject(BACKLOG_FILE, {
+        project_name: String(body.project_name ?? '').trim(),
+        brief: body.brief ? String(body.brief).trim() : null,
+        prompts: Array.isArray(body.prompts) && body.prompts.length
+          ? body.prompts.map((p) => ({ title: String(p?.title ?? '').trim(), prompt: String(p?.prompt ?? '').trim() })).filter((p) => p.prompt)
+          : null,
+        context: String(body.context ?? '').trim(),
+        deploy: {
+          enabled: body.deploy?.enabled !== false,
+          target: String(body.deploy?.target ?? 'auto'),
+          repo_name: String(body.deploy?.repo_name ?? '').trim() || slugify(String(body.project_name ?? ''), 'project'),
+        },
+      });
+      json(res, 200, { ok: true, item });
+    } catch (err) {
+      json(res, 400, { ok: false, error: String(err.message || err) });
+    }
+  },
+
+  'POST /api/backlog/remove': async (req, res) => {
+    const body = await readBody(req);
+    const ok = markStatus(BACKLOG_FILE, String(body.id ?? ''), 'done', { result: { message: 'removed from the backlog by hand' } });
+    json(res, ok ? 200 : 404, { ok });
   },
 
   'GET /api/tail': (req, res, url) => {
@@ -370,6 +518,12 @@ const server = http.createServer(async (req, res) => {
 server.listen(port, '127.0.0.1', () => {
   const addr = `http://127.0.0.1:${port}`;
   console.log(`Prompt Chain Runner dashboard: ${addr}`);
+  // First tick shortly after boot so a run orphaned by a reboot resumes on its
+  // own; the interval covers hangs during a long unattended night.
+  setTimeout(() => { try { watchdogTick(); } catch { /* never let the watchdog kill the dashboard */ } }, 5000);
+  setInterval(() => { try { watchdogTick(); } catch { /* ignore */ } }, 60000).unref();
+  setImmediate(refreshCapabilities);
+  setInterval(refreshCapabilities, 60 * 60 * 1000).unref();
   if (opts.open) {
     const cmd = process.platform === 'win32' ? ['cmd', ['/c', 'start', '', addr]]
       : process.platform === 'darwin' ? ['open', [addr]]

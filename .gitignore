@@ -4,6 +4,8 @@ logs/*.jsonl
 state.json
 .stop
 .runner.lock
+.capabilities.json
+memory/lessons.jsonl
 
 # The projects Claude Code builds live in their own repos, not this one
 target-project/**

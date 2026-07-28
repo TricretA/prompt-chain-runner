@@ -2,22 +2,31 @@
 'use strict';
 // The ORCHESTRATOR — the main agent of a small autonomous company.
 //
-// For every imported prompt it: sends the BUILDER agent to do the work, runs
-// auto-detected checks (exit codes never lie), sends the TESTER agent to
-// verify the builder's claims, routes failures back to the builder as fix
-// prompts, and commits every passing phase to git. When all prompts pass, the
-// DEPLOYER agent pushes the project to GitHub Pages and the orchestrator
-// independently polls the public URL until the site is actually live — only
-// then is the human notified. No human input from start to finish.
+// Give it a one-line brief (or a written prompt chain) and it runs the whole
+// company hands-free:
+//
+//   Planner   turns the brief into an ordered prompt chain
+//   Builder   builds each prompt; auto-detected checks gate it on exit codes
+//   Tester    verifies the claims in a real browser and files a verdict
+//   Debugger  when fixes stall, diagnoses the root cause (read-only)
+//   revert    when even that stalls, rolls back to the last good commit and
+//             makes the builder try a genuinely different approach
+//   Designer  looks at real screenshots and fixes what is ugly
+//   Security  blocks publication on secrets or critical exposure
+//   Deployer  ships to GitHub Pages / Vercel / Netlify — and the orchestrator
+//             independently proves the live URL serves a working site, assets
+//             included, before anyone is told it is done.
+//
+// It then pulls the next project off the backlog and does it again. The human
+// hears from it once: when everything is live (or when only they can unblock).
 //
 // Usage:
 //   node runner.js [--queue prompts/queue.json] [--config config.json]
-//                  [--logs logs] [--state state.json]
+//                  [--logs logs] [--state state.json] [--backlog prompts/backlog.json]
 //                  [--retry-stuck] [--dry-run]
 //
-// Exit codes: 0 all phases passed (and deployed, if enabled) · 1 runner error
-//             (incl. another runner already active) · 2 a phase or the deploy
-//             is stuck · 3 stopped via stop flag or signal
+// Exit codes: 0 finished (possibly with degraded phases) · 1 runner error ·
+//             2 halted, needs a human · 3 stopped
 
 const fs = require('fs');
 const path = require('path');
@@ -25,14 +34,21 @@ const { readJson, runStamp, formatDuration, truncate, slugify, pidAlive, pidLook
 const { Logger } = require('./lib/logger');
 const { writeState } = require('./lib/state');
 const { loadQueue, saveQueue } = require('./lib/queue');
-const { ensureGitRepo, commitPhase } = require('./lib/git');
+const { ensureGitRepo, commitPhase, treeHash, headCommit, revertTo } = require('./lib/git');
 const { verifyPhase } = require('./lib/verify');
 const { detectChecks, describeChecks } = require('./lib/autocheck');
 const { killActiveClaude } = require('./lib/claude');
-const { runBuilder, runBuilderFix, runTester, runDeployer } = require('./lib/agents');
-const { buildFixPrompt, buildDeployFixPrompt } = require('./lib/fix-prompt');
+const {
+  runPlanner, runBuilder, runBuilderFix, runTester, runDebugger,
+  runDesigner, runSecurity, runDeployer, normalizePlan,
+} = require('./lib/agents');
+const { buildFixPrompt, buildDeployFixPrompt, buildSecurityFixPrompt, evidenceSections } = require('./lib/fix-prompt');
 const { waitUntilLive } = require('./lib/live-check');
 const { notify } = require('./lib/notify');
+const { detectCapabilities, describeCapabilities, pickDeployTarget } = require('./lib/capabilities');
+const { sendRemote } = require('./lib/remote-notify');
+const { recordLesson, findLessons, formatLessons } = require('./lib/lessons');
+const { loadBacklog, nextPending, markStatus } = require('./lib/backlog');
 
 const ROOT = __dirname;
 
@@ -42,6 +58,7 @@ function parseArgs(argv) {
     config: path.join(ROOT, 'config.json'),
     logs: path.join(ROOT, 'logs'),
     state: path.join(ROOT, 'state.json'),
+    backlog: path.join(ROOT, 'prompts', 'backlog.json'),
     retryStuck: false,
     dryRun: false,
   };
@@ -51,6 +68,7 @@ function parseArgs(argv) {
     else if (a === '--config') opts.config = path.resolve(argv[++i]);
     else if (a === '--logs') opts.logs = path.resolve(argv[++i]);
     else if (a === '--state') opts.state = path.resolve(argv[++i]);
+    else if (a === '--backlog') opts.backlog = path.resolve(argv[++i]);
     else if (a === '--retry-stuck') opts.retryStuck = true;
     else if (a === '--dry-run') opts.dryRun = true;
     else if (a === '--help' || a === '-h') { printHelp(); process.exit(0); }
@@ -60,14 +78,15 @@ function parseArgs(argv) {
 }
 
 function printHelp() {
-  console.log(`Prompt Chain Runner — autonomous agent orchestrator
+  console.log(`Prompt Chain Runner — autonomous agent company
   node runner.js [options]
 
-  --queue <file>    prompt queue (default prompts/queue.json)
+  --queue <file>    the active project (default prompts/queue.json)
+  --backlog <file>  queued follow-up projects (default prompts/backlog.json)
   --config <file>   settings (default config.json)
   --logs <dir>      log directory (default logs/)
   --state <file>    live state file for the dashboard (default state.json)
-  --retry-stuck     reset phases marked "stuck" back to pending and retry them
+  --retry-stuck     reset phases marked stuck/degraded back to pending
   --dry-run         validate config + queue and print the plan, execute nothing`);
 }
 
@@ -96,6 +115,18 @@ function acquireLock(lockFile) {
     }
   }
   return -1;
+}
+
+// The escalation ladder. Retrying the same way five times is how a run burns
+// money without converging, so each rung changes something structural.
+function escalationFor(attempt, maxAttempts) {
+  if (attempt <= 1) return 'initial';
+  if (maxAttempts >= 4) {
+    if (attempt >= maxAttempts) return 'fresh_start';
+    if (attempt === maxAttempts - 1) return 'diagnosis';
+    if (attempt === 3) return 'lessons';
+  }
+  return 'fix';
 }
 
 function main() {
@@ -128,41 +159,45 @@ function main() {
 
   let queue;
   try {
-    queue = loadQueue(opts.queue); // throws with a clear message on bad queues
+    queue = loadQueue(opts.queue);
   } catch (err) {
     console.error(err.message);
     process.exit(1); // the exit handler releases the lock
   }
 
-  // Relative project paths resolve against the runner root, matching the
-  // documented layout (queue lives in prompts/, projects under projects/).
-  const projectPath = path.isAbsolute(queue.project_path)
-    ? queue.project_path
-    : path.resolve(ROOT, queue.project_path);
-
-  const projectName = queue.project_name || path.basename(projectPath);
-  const context = typeof queue.context === 'string' ? queue.context : '';
-  const deployCfg = {
-    enabled: false,
-    visibility: 'public',
-    verify_live: true,
-    live_timeout_ms: 15 * 60 * 1000,
-    ...(config.deploy || {}),
-    ...(queue.deploy || {}),
-  };
-  const repoName = slugify(deployCfg.repo_name || projectName, 'auto-built-site');
+  const maxRetries = config.max_retries ?? 5;
+  const maxAttempts = maxRetries + 1;
+  const onStuck = config.on_stuck === 'halt' ? 'halt' : 'continue';
   const testerEnabled = config.tester?.enabled !== false;
+  const designCfg = { enabled: true, rounds: 1, ...(config.design || {}) };
+  const securityCfg = { enabled: true, block_deploy: true, max_fix_rounds: 2, ...(config.security || {}) };
+  const budgetCfg = config.budget || {};
+  const lessonsFile = path.join(ROOT, 'memory', 'lessons.jsonl');
+  const lessonsEnabled = config.lessons?.enabled !== false;
+
+  const capabilities = detectCapabilities({
+    cacheFile: path.join(ROOT, '.capabilities.json'),
+    ttlMs: config.capabilities?.cache_ms,
+    override: config.capabilities?.override,
+  });
+  const capsText = describeCapabilities(capabilities);
 
   if (opts.dryRun) {
+    const projectPath = resolveProjectPath(queue);
     console.log('Dry run — nothing will be executed.\n');
-    console.log(`Project:      ${projectName}`);
+    console.log(`Project:      ${queue.project_name || path.basename(projectPath)}`);
     console.log(`Project path: ${projectPath}`);
+    console.log(`Source:       ${queue.phases.length ? `${queue.phases.length} written prompts` : `a one-line brief (the Planner will expand it)`}`);
     console.log(`Verification: ${Array.isArray(config.verification_steps) && config.verification_steps.length
       ? config.verification_steps.map((s) => s.name).join(', ') + ' (from config)'
       : `auto-detected (currently: ${describeChecks(detectChecks(projectPath))})`}`);
-    console.log(`Tester agent: ${testerEnabled ? 'enabled' : 'disabled'}`);
-    console.log(`Deploy:       ${deployCfg.enabled ? `GitHub repo "${repoName}" (${deployCfg.visibility}), live check ${deployCfg.verify_live ? 'on' : 'off'}` : 'disabled'}`);
-    console.log(`Max retries per phase: ${config.max_retries ?? 4}\n`);
+    console.log(`Tester:       ${testerEnabled ? 'on' : 'off'} · Design: ${designCfg.enabled ? `${designCfg.rounds} round(s)` : 'off'} · Security: ${securityCfg.enabled ? 'on' : 'off'}`);
+    console.log(`Deploy:       ${queue.deploy?.enabled === false ? 'off' : pickDeployTarget(capabilities, queue.deploy?.target || config.deploy?.target)}`);
+    console.log(`On stuck:     ${onStuck === 'continue' ? 'keep going (hands-free)' : 'halt'} · max attempts per prompt: ${maxAttempts}`);
+    console.log(`Budget:       ${budgetCfg.max_usd_per_run ? `$${budgetCfg.max_usd_per_run} per run` : 'no cap'}`);
+    console.log(`Backlog:      ${loadBacklog(opts.backlog).filter((i) => i.status === 'pending').length} project(s) queued after this one\n`);
+    console.log('Capabilities:');
+    console.log(capsText);
     for (const p of queue.phases) {
       console.log(`  [${p.status}] ${p.id}${p.title ? ` — ${p.title}` : ''} (retries so far: ${p.retries})`);
       console.log(`      ${p.prompt.split('\n')[0].slice(0, 100)}`);
@@ -170,8 +205,6 @@ function main() {
     console.log('\nQueue and config are valid.');
     process.exit(0);
   }
-
-  fs.mkdirSync(projectPath, { recursive: true });
 
   const runId = `run-${runStamp()}`;
   const logger = new Logger(opts.logs, runId);
@@ -183,51 +216,39 @@ function main() {
     if (fs.statSync(stopFile).mtimeMs < startedAtMs) fs.rmSync(stopFile, { force: true });
   } catch { /* no flag */ }
 
-  const maxRetries = config.max_retries ?? 4;
   const totals = { claude_calls: 0, cost_usd: 0, claude_ms: 0 };
-  const startedAt = new Date().toISOString();
-
   const state = {
     run_id: runId,
     pid: process.pid,
     status: 'running',
-    started_at: startedAt,
+    started_at: new Date().toISOString(),
+    heartbeat: new Date().toISOString(),
     queue_file: opts.queue,
     config_file: opts.config,
-    project_path: projectPath,
-    project_name: projectName,
+    backlog_file: opts.backlog,
+    project_path: null,
+    project_name: null,
     log_file: path.basename(logger.logFile),
     events_file: path.basename(logger.eventsFile),
+    stage: 'starting',
     current_phase: null,
     claude_pid: null,
     attempt: 0,
     message: 'starting',
     activity: { agent: null, detail: 'starting up' },
-    // A queue that already deployed successfully (queue.deploy_state) seeds
-    // "live" here, so rerunning a finished queue never silently redeploys.
-    deploy: (queue.deploy_state && queue.deploy_state.status === 'live' && deployCfg.enabled)
-      ? {
-        enabled: true,
-        status: 'live',
-        repo_name: repoName,
-        repo_url: queue.deploy_state.repo_url || null,
-        pages_url: queue.deploy_state.pages_url || null,
-        retries: 0,
-      }
-      : {
-        enabled: Boolean(deployCfg.enabled),
-        status: deployCfg.enabled ? 'pending' : 'disabled',
-        repo_name: deployCfg.enabled ? repoName : null,
-        repo_url: null,
-        pages_url: null,
-        retries: 0,
-      },
+    deploy: { enabled: false, status: 'disabled', repo_name: null, repo_url: null, pages_url: null, retries: 0 },
+    budget: { spent_usd: 0, cap_usd: budgetCfg.max_usd_per_run || null },
+    backlog: { done: 0, remaining: 0 },
+    capabilities: capabilities,
+    degraded: [],
     totals,
     phases: [],
   };
 
   const syncState = (patch = {}) => {
     Object.assign(state, patch);
+    state.heartbeat = new Date().toISOString();
+    state.budget.spent_usd = totals.cost_usd;
     state.phases = queue.phases.map((p) => ({
       id: p.id,
       title: p.title || p.id,
@@ -250,79 +271,69 @@ function main() {
 
   const persist = () => saveQueue(opts.queue, queue);
 
-  const sendNotification = (title, message, url) => {
-    // Even with the OS toast disabled the event is logged, so the dashboard
-    // feed always shows the moment the human was (or would have been) called.
+  const sendNotification = async (title, message, url, level = 'info') => {
     const channel = config.notify?.enabled === false ? 'disabled' : notify(title, message, url);
-    logger.event('notification', { title, message, url: url || null, channel });
+    let remote = [];
+    try {
+      remote = await sendRemote(config.notify || {}, { title, body: message, url, level });
+    } catch { /* a notification must never affect a build */ }
+    logger.event('notification', {
+      title, message, url: url || null, channel,
+      remote: remote.map((r) => `${r.channel}:${r.ok ? 'ok' : 'failed'}`),
+    });
     say('orchestrator', 'you', null, 'notify', `${title} — ${message}${url ? ` ${url}` : ''}`);
   };
 
-  const finish = (status, message, exitCode) => {
-    // Never leave an unattended Claude Code session editing the project after
+  const finish = async (status, message, exitCode) => {
+    // Never leave an unattended Claude Code session editing a project after
     // the runner itself is gone.
-    if (status !== 'passed_all') killActiveClaude();
+    if (exitCode !== 0) killActiveClaude();
     logger.section(`RUN ${status.toUpperCase()}: ${message}`);
-    logger.event('run_done', { status, message });
-    if (status === 'stuck' || status === 'error') {
-      sendNotification('Build halted — needs you', message);
+    logger.event('run_done', { status, message, totals });
+    if (status === 'stuck' || status === 'error' || status === 'budget_exhausted') {
+      await sendNotification('Build halted — needs you', message, null, 'error');
     }
-    syncState({ status, message, current_phase: null, claude_pid: null, activity: { agent: null, detail: message } });
+    syncState({ status, message, current_phase: null, claude_pid: null, stage: 'done', activity: { agent: null, detail: message } });
     persist();
     releaseLock();
     process.exit(exitCode);
   };
 
   const stopRequested = () => fs.existsSync(stopFile);
-  const stopNow = () => {
-    logger.event('stop_requested', {});
-    finish('stopped', 'Stop flag detected — run halted gracefully.', 3);
-  };
+  const stopNow = () => finish('stopped', 'Stop flag detected — run halted gracefully.', 3);
 
   for (const sig of ['SIGINT', 'SIGTERM']) {
     process.on(sig, () => {
       logger.log(`Received ${sig}, shutting down.`);
-      finish('stopped', `Interrupted by ${sig}.`, 3);
+      void finish('stopped', `Interrupted by ${sig}.`, 3);
     });
   }
 
-  // --- Startup normalization -----------------------------------------------
-  // A phase left "running" means a previous run crashed mid-phase: run it again.
-  for (const phase of queue.phases) {
-    if (phase.status === 'running' || phase.status === 'failed_retry') phase.status = 'pending';
-    if (opts.retryStuck && phase.status === 'stuck') {
-      phase.status = 'pending';
-      phase.retries = 0;
-      logger.log(`--retry-stuck: reset ${phase.id} to pending.`);
-    }
-  }
-
-  ensureGitRepo(projectPath, logger);
-
   logger.section(`RUN ${runId} started`);
-  logger.log(`Project: ${projectName} (${projectPath})`);
-  logger.log(`Queue:   ${opts.queue}`);
-  logger.log(`Config:  ${opts.config}`);
-  logger.log(`Phases:  ${queue.phases.length} total, ${queue.phases.filter((p) => p.status === 'passed').length} already passed`);
-  logger.log(`Tester:  ${testerEnabled ? 'enabled' : 'disabled'} · Deploy: ${deployCfg.enabled ? `github:${repoName}` : 'disabled'}`);
+  logger.log(`Capabilities:\n${capsText}`);
   logger.event('run_start', {
     run_id: runId,
     queue_file: opts.queue,
-    project_path: projectPath,
-    project_name: projectName,
-    phases: queue.phases.map((p) => ({ id: p.id, title: p.title || p.id })),
     max_retries: maxRetries,
+    on_stuck: onStuck,
     tester_enabled: testerEnabled,
-    deploy: state.deploy,
+    design: designCfg,
+    security: securityCfg,
+    budget: budgetCfg,
+    capabilities,
   });
-  syncState({ message: 'run started' });
-  persist();
 
-  runAll().catch((err) => {
+  runEverything().catch(async (err) => {
     logger.log(`FATAL: ${err.stack || err.message || err}`);
     logger.event('run_error', { error: String(err.stack || err.message || err) });
-    finish('error', `Runner crashed: ${err.message || err}`, 1);
+    await finish('error', `Runner crashed: ${err.message || err}`, 1);
   });
+
+  function resolveProjectPath(q) {
+    return path.isAbsolute(q.project_path) ? q.project_path : path.resolve(ROOT, q.project_path);
+  }
+
+  function onSpawn(pid) { syncState({ claude_pid: pid }); }
 
   function trackCall(res) {
     totals.claude_calls += 1;
@@ -335,212 +346,608 @@ function main() {
     syncState({ claude_pid: null });
   }
 
-  function onSpawn(pid) { syncState({ claude_pid: pid }); }
+  // Money is the one thing an unattended run can burn without limit, so the cap
+  // is checked before every agent call, not just between phases.
+  function budgetLeft() {
+    const cap = budgetCfg.max_usd_per_run;
+    return cap ? cap - totals.cost_usd : Infinity;
+  }
 
-  // --- The main loop --------------------------------------------------------
-  async function runAll() {
+  async function assertBudget(where) {
+    if (budgetLeft() > 0) return;
+    logger.event('budget_exhausted', { spent: totals.cost_usd, cap: budgetCfg.max_usd_per_run, where });
+    await finish('budget_exhausted',
+      `Budget cap of $${budgetCfg.max_usd_per_run} reached (spent $${totals.cost_usd.toFixed(2)}) at ${where}. Raise budget.max_usd_per_run to continue.`, 2);
+  }
+
+  // --- The outer loop: this project, then everything on the backlog ---------
+  async function runEverything() {
+    let built = 0;
+    while (true) {
+      const outcome = await runProject();
+      built += 1;
+      const backlogItems = loadBacklog(opts.backlog);
+      const next = nextPending(backlogItems);
+      syncState({ backlog: { done: built, remaining: backlogItems.filter((i) => i.status === 'pending').length } });
+      if (!next) {
+        await finish(outcome.status, `${outcome.message}${built > 1 ? ` (${built} projects this run)` : ''}`, outcome.exitCode);
+        return;
+      }
+      if (stopRequested()) stopNow();
+      logger.section(`NEXT PROJECT FROM BACKLOG: ${next.project_name}`);
+      say('orchestrator', 'orchestrator', null, 'backlog', `Starting the next queued project: ${next.project_name}`);
+      markStatus(opts.backlog, next.id, 'running');
+      queue = materializeBacklogItem(next);
+      persist();
+    }
+  }
+
+  // A backlog entry becomes the active queue. Briefs stay briefs — the Planner
+  // stage expands them once the project directory exists.
+  function materializeBacklogItem(item) {
+    const slug = slugify(item.project_name, 'project');
+    return {
+      project_name: item.project_name,
+      // An item may pin its own location; otherwise it lands beside the others.
+      project_path: (typeof item.project_path === 'string' && item.project_path.trim())
+        ? item.project_path
+        : `./projects/${slug}`,
+      context: item.context || '',
+      brief: item.brief || null,
+      backlog_id: item.id,
+      deploy: { enabled: item.deploy?.enabled !== false, target: item.deploy?.target || 'auto', repo_name: item.deploy?.repo_name || slug },
+      phases: (item.prompts || []).map((p, i) => ({
+        id: `prompt-${i + 1}`,
+        title: p.title || `Prompt ${i + 1}`,
+        prompt: p.prompt,
+        status: 'pending',
+        retries: 0,
+        commit_hash: null,
+      })),
+    };
+  }
+
+  // --- One project, start to live ------------------------------------------
+  async function runProject() {
+    const projectPath = resolveProjectPath(queue);
+    const projectName = queue.project_name || path.basename(projectPath);
+    const context = typeof queue.context === 'string' ? queue.context : '';
+    fs.mkdirSync(projectPath, { recursive: true });
+
+    const deployCfg = {
+      enabled: true, visibility: 'public', verify_live: true, live_timeout_ms: 15 * 60 * 1000, target: 'auto',
+      ...(config.deploy || {}),
+      ...(queue.deploy || {}),
+    };
+    const repoName = slugify(deployCfg.repo_name || projectName, 'auto-built-site');
+
+    syncState({
+      project_path: projectPath,
+      project_name: projectName,
+      stage: 'starting',
+      degraded: [],
+      deploy: (queue.deploy_state && queue.deploy_state.status === 'live' && deployCfg.enabled)
+        ? { enabled: true, status: 'live', repo_name: repoName, repo_url: queue.deploy_state.repo_url || null, pages_url: queue.deploy_state.pages_url || null, retries: 0 }
+        : {
+          enabled: Boolean(deployCfg.enabled),
+          status: deployCfg.enabled ? 'pending' : 'disabled',
+          repo_name: deployCfg.enabled ? repoName : null,
+          repo_url: null, pages_url: null, retries: 0,
+        },
+    });
+
+    // --- Plan ---------------------------------------------------------------
+    if (!queue.phases.length) {
+      if (!queue.brief || !queue.brief.trim()) {
+        await finish('error', 'The queue has neither prompts nor a brief — nothing to build.', 1);
+      }
+      await assertBudget('planning');
+      logger.section(`PLANNING: ${projectName}`);
+      setActivity('planner', `planning "${projectName}" from the brief`, { stage: 'planning' });
+      say('orchestrator', 'planner', null, 'inject', `New project: ${truncate(queue.brief, 300)}`);
+      logger.event('claude_start', { phase: 'plan', agent: 'planner' });
+
+      const plan = await runPlanner({ projectPath, config, onSpawn, brief: queue.brief, projectName, capabilities: capsText });
+      trackCall(plan);
+      const normalized = normalizePlan(plan.answer);
+      logger.event('claude_done', {
+        phase: 'plan', agent: 'planner', ok: plan.ok, duration_ms: plan.durationMs,
+        cost_usd: plan.parsed?.total_cost_usd ?? null, plan: normalized,
+      });
+
+      if (!normalized) {
+        await finish('stuck', `The Planner could not turn the brief into a build plan: ${truncate(plan.error || String(plan.parsed?.result ?? ''), 300)}`, 2);
+      }
+      queue.context = normalized.context || context;
+      queue.phases = normalized.prompts.map((p, i) => ({
+        id: `prompt-${i + 1}`, title: p.title, prompt: p.prompt,
+        status: 'pending', retries: 0, commit_hash: null,
+      }));
+      if (normalized.deploy_target && normalized.deploy_target !== 'auto' && (!queue.deploy || queue.deploy.target === 'auto' || !queue.deploy.target)) {
+        queue.deploy = { ...(queue.deploy || {}), target: normalized.deploy_target };
+        deployCfg.target = normalized.deploy_target;
+      }
+      persist();
+      syncState();
+      logger.log(`Plan: ${normalized.stack || '(no stack stated)'} — ${queue.phases.length} steps`);
+      say('planner', 'orchestrator', null, 'report', `Plan ready: ${normalized.stack || ''} · ${queue.phases.length} steps: ${queue.phases.map((p) => p.title).join(' → ')}`);
+    }
+
+    const projectContext = typeof queue.context === 'string' ? queue.context : context;
+
+    // A phase left "running" means a previous run crashed mid-phase: run it again.
+    for (const phase of queue.phases) {
+      if (phase.status === 'running' || phase.status === 'failed_retry') phase.status = 'pending';
+      if (opts.retryStuck && (phase.status === 'stuck' || phase.status === 'degraded')) {
+        phase.status = 'pending';
+        phase.retries = 0;
+        logger.log(`--retry-stuck: reset ${phase.id} to pending.`);
+      }
+    }
+
+    ensureGitRepo(projectPath, logger);
+    logger.section(`BUILDING ${projectName} (${queue.phases.length} prompts)`);
+    logger.event('project_start', {
+      project: projectName, project_path: projectPath,
+      phases: queue.phases.map((p) => ({ id: p.id, title: p.title || p.id })),
+    });
+    syncState({ stage: 'building' });
+    persist();
+
+    // Accumulated across phases: what exists now, and what must keep working.
+    let projectState = '';
+    const regression = [];
+    for (const p of queue.phases) {
+      if (p.status === 'passed' && p.criteria) regression.push(...p.criteria);
+    }
+    const degraded = [];
+
+    // --- Build every prompt -------------------------------------------------
     for (let i = 0; i < queue.phases.length; i++) {
       const phase = queue.phases[i];
 
       if (phase.status === 'passed') {
         logger.log(`Skipping ${phase.id} — already passed (commit ${phase.commit_hash || 'n/a'}).`);
+        if (phase.report_summary) projectState = appendState(projectState, phase, phase.report_summary);
         continue;
       }
+      if (phase.status === 'degraded') { degraded.push(phase.id); continue; }
       if (phase.status === 'stuck') {
-        finish('stuck', `${phase.id} is marked stuck from a previous run. Fix it or rerun with --retry-stuck.`, 2);
+        await finish('stuck', `${phase.id} is marked stuck from a previous run. Fix it or rerun with --retry-stuck.`, 2);
       }
       if (stopRequested()) stopNow();
 
-      const label = phase.title ? `${phase.id} — ${phase.title}` : phase.id;
-      logger.section(`PHASE ${label} (${i + 1}/${queue.phases.length})`);
-      logger.block(`prompt for ${phase.id}:`, phase.prompt);
-      logger.event('phase_start', { phase: phase.id, title: phase.title || phase.id, index: i, total: queue.phases.length, prompt: phase.prompt });
-
-      phase.status = 'running';
-      let fixPrompt = null; // null = send the original prompt
-      syncState({ current_phase: phase.id, attempt: phase.retries + 1 });
-      persist();
-
-      while (true) {
-        const attempt = phase.retries + 1;
-        const kind = fixPrompt ? 'fix' : 'initial';
-        logger.log(`Running ${phase.id}, attempt ${attempt}/${maxRetries + 1} (${kind} prompt)`);
-        logger.event('attempt_start', { phase: phase.id, attempt, max_attempts: maxRetries + 1, kind });
-
-        // 1. BUILDER does the work.
-        setActivity('builder', `${phase.id}: builder working (attempt ${attempt})`, { attempt });
-        say('orchestrator', 'builder', phase.id, kind === 'fix' ? 'fix' : 'inject',
-          kind === 'fix' ? `Your last attempt failed — fix it. (attempt ${attempt})` : `New task: ${phase.title || phase.id}`);
-        logger.event('claude_start', { phase: phase.id, agent: 'builder', attempt, kind });
-        const build = fixPrompt
-          ? await runBuilderFix({ projectPath, config, onSpawn, fixPrompt })
-          : await runBuilder({ projectPath, config, onSpawn, phase: phase.id, index: i, total: queue.phases.length, context, prompt: phase.prompt });
-        trackCall(build);
-
-        if (!build.ok) {
-          // The CLI call itself failed (crash, timeout, not installed). There
-          // is no failure evidence to fix from — retry the same prompt.
-          logger.log(`Builder call FAILED: ${build.error}`);
-          if (build.stderr) logger.block('builder stderr:', truncate(build.stderr, 4000));
-          logger.event('claude_error', { phase: phase.id, agent: 'builder', attempt, error: build.error, duration_ms: build.durationMs });
-          say('builder', 'orchestrator', phase.id, 'error', `My session crashed: ${truncate(build.error, 300)}`);
-
-          phase.retries += 1;
-          if (phase.retries > maxRetries) {
-            phase.status = 'stuck';
-            logger.event('phase_stuck', { phase: phase.id, retries: phase.retries, reason: 'claude_call_failed' });
-            persist();
-            finish('stuck', `${phase.id} stuck: the builder session kept failing. Last error: ${build.error}`, 2);
-          }
-          phase.status = 'failed_retry';
-          setActivity(null, `${phase.id}: builder crashed, retrying (${phase.retries}/${maxRetries})`);
-          persist();
-          if (stopRequested()) stopNow();
-          phase.status = 'running';
-          continue;
-        }
-
-        const resultText = String(build.parsed?.result ?? '').trim();
-        const reportSummary = build.report?.summary || resultText.slice(0, 300) || '(no report)';
-        logger.log(`Builder finished in ${formatDuration(build.durationMs)} (cost $${build.parsed?.total_cost_usd ?? '?'})`);
-        if (resultText) logger.block('builder result:', truncate(resultText, 4000));
-        logger.event('claude_done', {
-          phase: phase.id,
-          agent: 'builder',
-          attempt,
-          ok: true,
-          duration_ms: build.durationMs,
-          cost_usd: build.parsed?.total_cost_usd ?? null,
-          num_turns: build.parsed?.num_turns ?? null,
-          result: truncate(resultText, 2000),
-          report: build.report || null,
-        });
-        say('builder', 'orchestrator', phase.id, 'report', `Done. ${truncate(reportSummary, 400)}`);
-
-        if (stopRequested()) stopNow();
-
-        // 2. Auto-detected checks — exit codes never hallucinate.
-        setActivity(null, `${phase.id}: running automated checks`);
-        logger.event('verify_start', { phase: phase.id, attempt });
-        const verification = await verifyPhase(projectPath, config, logger, phase.id, stopRequested);
-        if (verification.aborted) stopNow();
-        const failedSteps = Object.entries(verification.results).filter(([, r]) => !r.passed).map(([n]) => n);
-        const checkNames = Object.keys(verification.results);
-        logger.event('verify_result', { phase: phase.id, attempt, all_passed: verification.allPassed, steps: checkNames, failed_steps: failedSteps });
-        say('orchestrator', 'orchestrator', phase.id, 'checks',
-          checkNames.length
-            ? `Automated checks (${checkNames.join(', ')}): ${verification.allPassed ? 'all passed' : `FAILED ${failedSteps.join(', ')}`}`
-            : 'No automated checks apply yet.');
-
-        let verdict = null;
-        if (verification.allPassed) {
-          if (stopRequested()) stopNow();
-          // 3. TESTER verifies the builder's claims.
-          if (testerEnabled) {
-            setActivity('tester', `${phase.id}: tester verifying the builder's work`);
-            say('orchestrator', 'tester', phase.id, 'test_request', `Builder says: "${truncate(reportSummary, 200)}". Verify it.`);
-            logger.event('claude_start', { phase: phase.id, agent: 'tester', attempt });
-            const test = await runTester({
-              projectPath, config, onSpawn,
-              phase: phase.id, context, prompt: phase.prompt,
-              report: build.report, builderResult: resultText,
-              autoSummary: checkNames.length ? `${checkNames.join(', ')} — all exited 0` : 'none applied',
-            });
-            trackCall(test);
-            verdict = test.verdict;
-            logger.log(`Tester verdict: ${verdict.pass ? 'PASS' : 'FAIL'} — ${verdict.summary}`);
-            logger.event('verdict', {
-              phase: phase.id,
-              attempt,
-              pass: verdict.pass,
-              summary: verdict.summary,
-              failures: verdict.failures,
-              source: verdict.source,
-              duration_ms: test.durationMs,
-              cost_usd: test.parsed?.total_cost_usd ?? null,
-            });
-            say('tester', 'orchestrator', phase.id, 'verdict',
-              verdict.pass ? `PASS — ${truncate(verdict.summary, 300)}` : `FAIL — ${truncate(verdict.summary, 300)}`);
-          } else {
-            verdict = { pass: true, summary: 'tester disabled', failures: [] };
-          }
-
-          if (verdict.pass) {
-            // 4. Commit and move on.
-            phase.commit_hash = commitPhase(projectPath, phase.id);
-            phase.status = 'passed';
-            logger.log(`${phase.id} PASSED (auto-checks + tester), commit ${phase.commit_hash}`);
-            logger.event('commit', { phase: phase.id, hash: phase.commit_hash });
-            logger.event('phase_passed', { phase: phase.id, retries: phase.retries, hash: phase.commit_hash });
-            say('orchestrator', 'orchestrator', phase.id, 'passed', `${phase.title || phase.id} locked in (commit ${phase.commit_hash.slice(0, 8)}). Moving on.`);
-            setActivity(null, `${phase.id} passed (commit ${phase.commit_hash.slice(0, 8)})`);
-            persist();
-            break;
-          }
-        }
-
-        // 5. Something failed — build a fix prompt from the exact evidence.
-        phase.retries += 1;
-        const reason = failedSteps.length ? `checks: ${failedSteps.join(', ')}` : `tester: ${verdict?.summary || 'rejected'}`;
-        logger.log(`${phase.id} failed (${reason}). Retry ${phase.retries}/${maxRetries}.`);
-
-        if (phase.retries > maxRetries) {
-          phase.status = 'stuck';
-          logger.event('phase_stuck', { phase: phase.id, retries: phase.retries, reason: failedSteps.length ? 'verification_failed' : 'tester_rejected', failed_steps: failedSteps });
-          persist();
-          finish('stuck', `${phase.id} stuck after ${phase.retries} attempts (${reason}). See the logs.`, 2);
-        }
-
-        phase.status = 'failed_retry';
-        fixPrompt = buildFixPrompt({ originalPrompt: phase.prompt, autoResults: verification.results, verdict, config });
-        logger.block(`fix prompt for ${phase.id} (attempt ${phase.retries + 1}):`, truncate(fixPrompt, 6000));
-        logger.event('fix_prompt', { phase: phase.id, attempt: phase.retries + 1, prompt: fixPrompt });
-        setActivity(null, `${phase.id} failed (${reason}) — sending fix prompt (${phase.retries}/${maxRetries})`);
-        persist();
-        if (stopRequested()) stopNow();
-        phase.status = 'running';
+      const outcome = await runPhase({ phase, index: i, projectPath, projectName, context: projectContext, projectState, regression });
+      if (outcome.passed) {
+        projectState = appendState(projectState, phase, outcome.summary);
+        if (outcome.criteria?.length) regression.push(...outcome.criteria);
+      } else {
+        degraded.push(phase.id);
+        syncState({ degraded });
       }
     }
 
-    // --- Deploy stage --------------------------------------------------------
-    if (deployCfg.enabled) {
-      if (state.deploy.status === 'live' && state.deploy.pages_url) {
-        // This queue already deployed in a previous run — don't redeploy or
-        // re-notify, just confirm and finish.
-        logger.log(`Skipping deploy — already live at ${state.deploy.pages_url}`);
-        logger.event('deploy_skipped', { pages_url: state.deploy.pages_url, repo_url: state.deploy.repo_url });
-        finish('passed_all', `All phases complete and the site is live: ${state.deploy.pages_url}`, 0);
+    // --- Design -------------------------------------------------------------
+    if (designCfg.enabled && queue.phases.some((p) => p.status === 'passed')) {
+      await runDesignStage({ projectPath, context: projectContext });
+    }
+
+    // --- Security -----------------------------------------------------------
+    let securityBlocked = false;
+    if (securityCfg.enabled && deployCfg.enabled) {
+      securityBlocked = await runSecurityStage({ projectPath, context: projectContext, target: deployCfg.target });
+    }
+
+    // --- Deploy -------------------------------------------------------------
+    const summaryBits = [`${queue.phases.filter((p) => p.status === 'passed').length}/${queue.phases.length} prompts built and tested`];
+    if (degraded.length) summaryBits.push(`${degraded.length} could not be completed (${degraded.join(', ')})`);
+
+    if (securityBlocked) {
+      const msg = `${projectName}: security gate blocked publication. ${summaryBits.join('; ')}.`;
+      await sendNotification(`${projectName} — blocked before going public`, msg, null, 'error');
+      finishProjectInBacklog('failed', { message: msg });
+      return { status: 'stuck', message: msg, exitCode: 2 };
+    }
+
+    if (!deployCfg.enabled) {
+      const msg = `${projectName} built. ${summaryBits.join('; ')}. (Deploy is off.)`;
+      await sendNotification(`${projectName} build complete`, msg, null, degraded.length ? 'error' : 'success');
+      finishProjectInBacklog('done', { message: msg });
+      return { status: degraded.length ? 'passed_with_issues' : 'passed_all', message: msg, exitCode: 0 };
+    }
+
+    if (state.deploy.status === 'live' && state.deploy.pages_url) {
+      logger.log(`Skipping deploy — already live at ${state.deploy.pages_url}`);
+      logger.event('deploy_skipped', { pages_url: state.deploy.pages_url });
+      const msg = `${projectName} was already live at ${state.deploy.pages_url}`;
+      finishProjectInBacklog('done', { message: msg, pages_url: state.deploy.pages_url });
+      return { status: 'passed_all', message: msg, exitCode: 0 };
+    }
+
+    const deployed = await runDeployStage({ projectPath, projectName, repoName, deployCfg, context: projectContext });
+    if (!deployed.ok) {
+      const msg = `${projectName}: could not get the site live. ${truncate(deployed.evidence || '', 200)}`;
+      await sendNotification(`${projectName} — deploy failed`, msg, null, 'error');
+      finishProjectInBacklog('failed', { message: msg });
+      return { status: 'stuck', message: msg, exitCode: 2 };
+    }
+
+    const msg = `${summaryBits.join('; ')}. Live at ${state.deploy.pages_url}`;
+    await sendNotification(
+      degraded.length ? `${projectName} is LIVE (with ${degraded.length} unfinished step${degraded.length > 1 ? 's' : ''})` : `${projectName} is LIVE`,
+      msg, state.deploy.pages_url, degraded.length ? 'info' : 'success'
+    );
+    finishProjectInBacklog('done', { message: msg, pages_url: state.deploy.pages_url, repo_url: state.deploy.repo_url });
+    return {
+      status: degraded.length ? 'passed_with_issues' : 'passed_all',
+      message: `${projectName}: ${msg}`,
+      exitCode: 0,
+    };
+  }
+
+  function finishProjectInBacklog(status, result) {
+    if (queue.backlog_id) markStatus(opts.backlog, queue.backlog_id, status, { result });
+  }
+
+  function appendState(projectState, phase, summary) {
+    const line = `- ${phase.title || phase.id}: ${truncate(String(summary || 'done'), 300)}`;
+    const next = `${projectState}\n${line}`.trim();
+    return next.length > 2500 ? next.slice(-2500) : next;
+  }
+
+  // --- One prompt, through the whole escalation ladder ----------------------
+  async function runPhase({ phase, index, projectPath, projectName, context, projectState, regression }) {
+    const label = phase.title ? `${phase.id} — ${phase.title}` : phase.id;
+    logger.section(`PHASE ${label} (${index + 1}/${queue.phases.length})`);
+    logger.block(`prompt for ${phase.id}:`, phase.prompt);
+    logger.event('phase_start', { phase: phase.id, title: phase.title || phase.id, index, total: queue.phases.length, prompt: phase.prompt });
+
+    phase.status = 'running';
+    const goodCommit = headCommit(projectPath); // where a fresh_start rolls back to
+    const history = [];
+    let lastEvidence = '';   // stays empty while only the SESSION has failed
+    let lastAutoResults = {};
+    let lastVerdict = null;
+    let diagnosis = null;
+    syncState({ current_phase: phase.id, attempt: phase.retries + 1, stage: 'building' });
+    persist();
+
+    while (true) {
+      await assertBudget(`${phase.id}`);
+      const attempt = phase.retries + 1;
+      const strategy = escalationFor(attempt, maxAttempts);
+      logger.log(`Running ${phase.id}, attempt ${attempt}/${maxAttempts} (strategy: ${strategy})`);
+      logger.event('attempt_start', { phase: phase.id, attempt, max_attempts: maxAttempts, kind: strategy });
+
+      // --- rung: read-only root-cause analysis before the next build round ---
+      if (strategy === 'diagnosis' && !diagnosis) {
+        setActivity('debugger', `${phase.id}: debugger hunting the root cause`);
+        say('orchestrator', 'debugger', phase.id, 'inject', `${attempt - 1} fixes failed. Find the real cause — change nothing.`);
+        logger.event('claude_start', { phase: phase.id, agent: 'debugger', attempt });
+        const dbg = await runDebugger({
+          projectPath, config, onSpawn, phase: phase.id, context, prompt: phase.prompt,
+          history: history.join('\n\n') || lastEvidence, capabilities: capsText,
+        });
+        trackCall(dbg);
+        diagnosis = dbg.diagnosis;
+        logger.event('diagnosis', { phase: phase.id, attempt, diagnosis: diagnosis || null, ok: dbg.ok, duration_ms: dbg.durationMs, cost_usd: dbg.parsed?.total_cost_usd ?? null });
+        say('debugger', 'orchestrator', phase.id, diagnosis ? 'report' : 'error',
+          diagnosis ? `Root cause: ${truncate(String(diagnosis.root_cause || ''), 400)}` : 'I could not produce a diagnosis.');
       }
-      await deployStage();
-      sendNotification(
-        `${projectName} is LIVE`,
-        `All ${queue.phases.length} prompts built, tested and deployed.`,
-        state.deploy.pages_url || state.deploy.repo_url
-      );
-      finish('passed_all', `All phases complete and the site is live: ${state.deploy.pages_url || state.deploy.repo_url}`, 0);
-    } else {
-      sendNotification(`${projectName} build complete`, `All ${queue.phases.length} prompts built and tested. (Deploy is disabled.)`);
-      finish('passed_all', 'All phases complete.', 0);
+
+      // --- rung: throw the broken work away and start this prompt over -------
+      if (strategy === 'fresh_start' && goodCommit) {
+        const reverted = revertTo(projectPath, goodCommit);
+        logger.log(`fresh start: ${reverted ? `reverted to ${goodCommit.slice(0, 8)}` : 'revert failed, continuing on the current tree'}`);
+        logger.event('revert', { phase: phase.id, attempt, commit: goodCommit, ok: reverted });
+        if (reverted) say('orchestrator', 'builder', phase.id, 'revert', `Rolled back to the last good commit. Start over and take a different approach.`);
+      }
+
+      let lessonsText = '';
+      if (lessonsEnabled && (strategy === 'lessons' || strategy === 'fresh_start') && lastEvidence) {
+        lessonsText = formatLessons(findLessons(lessonsFile, lastEvidence, 3));
+        if (lessonsText) logger.event('lessons_used', { phase: phase.id, attempt });
+      }
+
+      // 1. BUILDER does the work.
+      setActivity('builder', `${phase.id}: builder working (attempt ${attempt}${strategy === 'initial' ? '' : `, ${strategy}`})`, { attempt });
+      say('orchestrator', 'builder', phase.id, strategy === 'initial' ? 'inject' : 'fix',
+        strategy === 'initial' ? `New task: ${phase.title || phase.id}` : `Attempt ${attempt} — ${strategy.replace('_', ' ')}.`);
+      logger.event('claude_start', { phase: phase.id, agent: 'builder', attempt, kind: strategy });
+
+      // With no failure evidence yet (the session itself kept dying), a "fix"
+      // prompt would carry nothing to fix — resend the real task instead.
+      const build = (strategy === 'initial' || !lastEvidence)
+        ? await runBuilder({
+          projectPath, config, onSpawn, phase: phase.id, index, total: queue.phases.length,
+          context, prompt: phase.prompt, capabilities: capsText, projectState,
+        })
+        : await runBuilderFix({
+          projectPath, config, onSpawn,
+          fixPrompt: buildFixPrompt({
+            originalPrompt: phase.prompt, autoResults: lastAutoResults, verdict: lastVerdict, config,
+            strategy, lessons: lessonsText, diagnosis, attemptHistory: history.join('\n\n'),
+          }),
+        });
+      trackCall(build);
+
+      if (!build.ok) {
+        logger.log(`Builder call FAILED: ${build.error}`);
+        if (build.stderr) logger.block('builder stderr:', truncate(build.stderr, 4000));
+        logger.event('claude_error', { phase: phase.id, agent: 'builder', attempt, error: build.error, duration_ms: build.durationMs });
+        say('builder', 'orchestrator', phase.id, 'error', `My session failed: ${truncate(build.error, 300)}`);
+        history.push(`attempt ${attempt} (${strategy}): the builder session itself failed — ${truncate(build.error, 300)}`);
+        const done = await consumeAttempt(phase, `the builder session kept failing (${truncate(build.error, 150)})`);
+        if (done) return { passed: false };
+        continue;
+      }
+
+      const resultText = String(build.parsed?.result ?? '').trim();
+      const reportSummary = build.report?.summary || resultText.slice(0, 300) || '(no report)';
+      logger.log(`Builder finished in ${formatDuration(build.durationMs)} (cost $${build.parsed?.total_cost_usd ?? '?'})`);
+      if (resultText) logger.block('builder result:', truncate(resultText, 4000));
+      logger.event('claude_done', {
+        phase: phase.id, agent: 'builder', attempt, ok: true,
+        duration_ms: build.durationMs, cost_usd: build.parsed?.total_cost_usd ?? null,
+        num_turns: build.parsed?.num_turns ?? null, result: truncate(resultText, 2000), report: build.report || null,
+      });
+      say('builder', 'orchestrator', phase.id, 'report', `Done. ${truncate(reportSummary, 400)}`);
+
+      if (stopRequested()) stopNow();
+
+      // 2. Auto-detected checks — exit codes never hallucinate.
+      setActivity(null, `${phase.id}: running automated checks`);
+      logger.event('verify_start', { phase: phase.id, attempt });
+      const verification = await verifyPhase(projectPath, config, logger, phase.id, stopRequested);
+      if (verification.aborted) stopNow();
+      lastAutoResults = verification.results;
+      const failedSteps = Object.entries(verification.results).filter(([, r]) => !r.passed).map(([n]) => n);
+      const checkNames = Object.keys(verification.results);
+      logger.event('verify_result', { phase: phase.id, attempt, all_passed: verification.allPassed, steps: checkNames, failed_steps: failedSteps });
+      say('orchestrator', 'orchestrator', phase.id, 'checks',
+        checkNames.length
+          ? `Automated checks (${checkNames.join(', ')}): ${verification.allPassed ? 'all passed' : `FAILED ${failedSteps.join(', ')}`}`
+          : 'No automated checks apply to this project yet.');
+
+      lastVerdict = null;
+      if (verification.allPassed) {
+        if (stopRequested()) stopNow();
+        // 3. TESTER verifies the builder's claims — and the earlier ones.
+        if (testerEnabled) {
+          await assertBudget(`${phase.id} tester`);
+          const before = treeHash(projectPath);
+          setActivity('tester', `${phase.id}: tester verifying the work`);
+          say('orchestrator', 'tester', phase.id, 'test_request',
+            `Builder says: "${truncate(reportSummary, 200)}". Verify it${regression.length ? `, plus ${regression.length} earlier criteria` : ''}.`);
+          logger.event('claude_start', { phase: phase.id, agent: 'tester', attempt });
+          const test = await runTester({
+            projectPath, config, onSpawn, phase: phase.id, context, prompt: phase.prompt,
+            report: build.report, builderResult: resultText,
+            autoSummary: checkNames.length ? `${checkNames.join(', ')} — all exited 0` : 'none applied',
+            capabilities: capsText, regression: regression.slice(-8),
+          });
+          trackCall(test);
+          lastVerdict = test.verdict;
+
+          // The tester was told to judge, not repair. If the tree moved, its
+          // PASS is not trustworthy — it may have fixed what it was grading.
+          const after = treeHash(projectPath);
+          if (before && after && before !== after && lastVerdict.pass) {
+            lastVerdict = {
+              ...lastVerdict, pass: false,
+              summary: `Tester modified the project while judging it — verdict void. (${lastVerdict.summary})`,
+              failures: [...(lastVerdict.failures || []), {
+                what: 'The QA agent changed project files instead of only testing them, so its PASS cannot be trusted.',
+                evidence: `working tree fingerprint changed during the tester run (${before.slice(0, 8)} -> ${after.slice(0, 8)})`,
+                suggested_fix: 'Review what changed, make the behavior correct in the source yourself, and leave the tree exactly as you found it.',
+              }],
+            };
+            logger.event('tester_modified_tree', { phase: phase.id, attempt, before, after });
+          }
+
+          logger.log(`Tester verdict: ${lastVerdict.pass ? 'PASS' : 'FAIL'} — ${lastVerdict.summary}`);
+          logger.event('verdict', {
+            phase: phase.id, attempt, pass: lastVerdict.pass, summary: lastVerdict.summary,
+            failures: lastVerdict.failures, criteria: lastVerdict.criteria, source: lastVerdict.source,
+            duration_ms: test.durationMs, cost_usd: test.parsed?.total_cost_usd ?? null,
+          });
+          say('tester', 'orchestrator', phase.id, 'verdict',
+            lastVerdict.pass ? `PASS — ${truncate(lastVerdict.summary, 300)}` : `FAIL — ${truncate(lastVerdict.summary, 300)}`);
+        } else {
+          lastVerdict = { pass: true, summary: 'tester disabled', failures: [], criteria: [] };
+        }
+
+        if (lastVerdict.pass) {
+          phase.commit_hash = commitPhase(projectPath, phase.id);
+          phase.status = 'passed';
+          phase.report_summary = truncate(reportSummary, 300);
+          phase.criteria = lastVerdict.criteria || [];
+          logger.log(`${phase.id} PASSED, commit ${phase.commit_hash}`);
+          logger.event('commit', { phase: phase.id, hash: phase.commit_hash });
+          logger.event('phase_passed', { phase: phase.id, retries: phase.retries, hash: phase.commit_hash, criteria: phase.criteria });
+          say('orchestrator', 'orchestrator', phase.id, 'passed', `${phase.title || phase.id} locked in (commit ${phase.commit_hash.slice(0, 8)}). Moving on.`);
+          setActivity(null, `${phase.id} passed (commit ${phase.commit_hash.slice(0, 8)})`);
+          persist();
+
+          // What just worked, remembered for future runs of any project.
+          if (lessonsEnabled && phase.retries > 0 && lastEvidence) {
+            recordLesson(lessonsFile, {
+              project: projectName, phase: phase.id, agent: 'builder',
+              error: lastEvidence, fix: reportSummary, evidence: truncate(history.join('\n'), 1200),
+            });
+          }
+          return { passed: true, summary: reportSummary, criteria: phase.criteria };
+        }
+      }
+
+      // 4. Failed — record the evidence and climb the ladder.
+      const reason = failedSteps.length ? `checks: ${failedSteps.join(', ')}` : `tester: ${lastVerdict?.summary || 'rejected'}`;
+      lastEvidence = evidenceSections(lastAutoResults, lastVerdict, 4000).join('\n\n') || reason;
+      history.push(`attempt ${attempt} (${strategy}) failed — ${truncate(reason, 400)}`);
+      logger.log(`${phase.id} failed (${reason}).`);
+      const done = await consumeAttempt(phase, reason);
+      if (done) return { passed: false };
     }
   }
 
-  async function deployStage() {
-    logger.section('DEPLOY — putting the site live on GitHub');
-    logger.event('deploy_start', { repo_name: repoName, visibility: deployCfg.visibility });
+
+  // Shared retry accounting. Returns true when the phase is finished (degraded
+  // or the run halted) and the caller should stop looping.
+  async function consumeAttempt(phase, reason) {
+    phase.retries += 1;
+    if (phase.retries >= maxAttempts) {
+      if (onStuck === 'halt') {
+        phase.status = 'stuck';
+        logger.event('phase_stuck', { phase: phase.id, retries: phase.retries, reason });
+        persist();
+        await finish('stuck', `${phase.id} stuck after ${phase.retries} attempts (${reason}).`, 2);
+        return true;
+      }
+      // Hands-free: record the failure honestly and keep building the rest.
+      phase.status = 'degraded';
+      logger.log(`${phase.id} DEGRADED after ${phase.retries} attempts (${reason}). Continuing with the remaining prompts.`);
+      logger.event('phase_degraded', { phase: phase.id, retries: phase.retries, reason });
+      say('orchestrator', 'orchestrator', phase.id, 'degraded',
+        `Could not complete ${phase.title || phase.id} after ${phase.retries} attempts (${truncate(reason, 200)}). Moving on — this will be in the final report.`);
+      persist();
+      return true;
+    }
+    phase.status = 'failed_retry';
+    setActivity(null, `${phase.id} failed (${truncate(reason, 120)}) — retrying ${phase.retries}/${maxRetries}`);
+    persist();
+    if (stopRequested()) stopNow();
+    phase.status = 'running';
+    return false;
+  }
+
+  // --- Design --------------------------------------------------------------
+  async function runDesignStage({ projectPath, context }) {
+    let previousIssues = [];
+    for (let round = 1; round <= (designCfg.rounds || 1); round++) {
+      if (stopRequested()) stopNow();
+      await assertBudget('design');
+      logger.section(`DESIGN REVIEW round ${round}/${designCfg.rounds}`);
+      setActivity('designer', `design review round ${round} — looking at real screenshots`, { stage: 'design', current_phase: 'design' });
+      say('orchestrator', 'designer', 'design', 'inject', `Look at the built site and fix what looks bad (round ${round}).`);
+      logger.event('claude_start', { phase: 'design', agent: 'designer', attempt: round });
+
+      const des = await runDesigner({ projectPath, config, onSpawn, context, capabilities: capsText, round, rounds: designCfg.rounds || 1, previousIssues });
+      trackCall(des);
+      const d = des.design;
+      logger.event('design_result', {
+        round, ok: des.ok, design: d || null,
+        duration_ms: des.durationMs, cost_usd: des.parsed?.total_cost_usd ?? null,
+      });
+
+      if (!d) {
+        say('designer', 'orchestrator', 'design', 'error', 'I could not complete the design review.');
+        logger.log('Design round produced no report — continuing.');
+        break;
+      }
+      say('designer', 'orchestrator', 'design', 'report',
+        `Design ${d.score_before ?? '?'}→${d.score_after ?? '?'}/10. Fixed ${(d.changes_made || []).length} thing(s)${(d.remaining_issues || []).length ? `, ${(d.remaining_issues || []).length} left` : ''}.`);
+      previousIssues = d.remaining_issues || [];
+
+      // The designer edited real files — re-gate them and keep the commit
+      // history one-change-per-commit.
+      const verification = await verifyPhase(projectPath, config, logger, 'design', stopRequested);
+      if (verification.aborted) stopNow();
+      if (!verification.allPassed) {
+        const failed = Object.entries(verification.results).filter(([, r]) => !r.passed).map(([n]) => n);
+        logger.log(`Design round ${round} broke automated checks (${failed.join(', ')}) — reverting the design changes.`);
+        logger.event('design_reverted', { round, failed_steps: failed });
+        revertTo(projectPath, headCommit(projectPath));
+        say('orchestrator', 'orchestrator', 'design', 'revert', `Design changes broke ${failed.join(', ')} — rolled them back.`);
+        break;
+      }
+      const hash = commitPhase(projectPath, 'design', `auto: design review round ${round}`);
+      logger.event('commit', { phase: 'design', hash, round });
+      if (!previousIssues.length) break; // nothing left worth another round
+    }
+  }
+
+  // --- Security ------------------------------------------------------------
+  // Returns true when publication must be blocked.
+  async function runSecurityStage({ projectPath, context, target }) {
+    for (let round = 1; round <= (securityCfg.max_fix_rounds || 2) + 1; round++) {
+      if (stopRequested()) stopNow();
+      await assertBudget('security');
+      logger.section(`SECURITY GATE (round ${round})`);
+      setActivity('security', 'security gate — checking before anything goes public', { stage: 'security', current_phase: 'security' });
+      say('orchestrator', 'security', 'security', 'inject', 'Last check before this goes public.');
+      logger.event('claude_start', { phase: 'security', agent: 'security', attempt: round });
+
+      const sec = await runSecurity({ projectPath, config, onSpawn, context, capabilities: capsText, target });
+      trackCall(sec);
+      const s = sec.security;
+      logger.event('security_result', {
+        round, ok: sec.ok, security: s || null,
+        duration_ms: sec.durationMs, cost_usd: sec.parsed?.total_cost_usd ?? null,
+      });
+
+      if (!s) {
+        // No report is not a licence to publish blind, but it is also not
+        // evidence of a leak — warn loudly and continue.
+        say('security', 'orchestrator', 'security', 'error', 'I could not complete the audit — no report written.');
+        logger.log('Security agent wrote no report; continuing to deploy with a warning.');
+        return false;
+      }
+
+      const critical = s.critical || [];
+      say('security', 'orchestrator', 'security', s.pass ? 'verdict' : 'error',
+        `${s.pass ? 'PASS' : 'BLOCKED'} — ${truncate(s.summary || '', 300)}${critical.length ? ` (${critical.length} critical)` : ''}`);
+      if ((s.changes_made || []).length) {
+        commitPhase(projectPath, 'security', 'auto: security agent removed a secret');
+      }
+      if (s.pass || !critical.length) return false;
+      if (round > (securityCfg.max_fix_rounds || 2)) break;
+      if (!securityCfg.block_deploy) return false;
+
+      // Send it back to a builder to repair, then audit again.
+      await assertBudget('security fix');
+      setActivity('builder', `security: builder fixing ${critical.length} critical finding(s)`);
+      say('orchestrator', 'builder', 'security', 'fix', `Security blocked release: ${truncate(critical.map((c) => c.what).join('; '), 300)}`);
+      const fix = await runBuilderFix({ projectPath, config, onSpawn, fixPrompt: buildSecurityFixPrompt({ security: s, context }) });
+      trackCall(fix);
+      logger.event('claude_done', { phase: 'security', agent: 'builder', attempt: round, ok: fix.ok, duration_ms: fix.durationMs, cost_usd: fix.parsed?.total_cost_usd ?? null, report: fix.report || null });
+      const verification = await verifyPhase(projectPath, config, logger, 'security', stopRequested);
+      if (verification.aborted) stopNow();
+      if (verification.allPassed) commitPhase(projectPath, 'security', 'auto: security fixes');
+    }
+    logger.event('security_blocked', {});
+    return securityCfg.block_deploy !== false;
+  }
+
+  // --- Deploy --------------------------------------------------------------
+  async function runDeployStage({ projectPath, projectName, repoName, deployCfg, context }) {
+    const target = pickDeployTarget(capabilities, deployCfg.target);
+    if (target === 'none') {
+      const evidence = 'No deployment platform is available and authenticated on this machine (checked GitHub, Vercel, Netlify).';
+      logger.event('deploy_unavailable', { evidence });
+      state.deploy.status = 'failed';
+      syncState();
+      return { ok: false, evidence };
+    }
+
+    logger.section(`DEPLOY — ${projectName} to ${target}`);
+    logger.event('deploy_start', { repo_name: repoName, visibility: deployCfg.visibility, target });
     state.deploy.status = 'deploying';
+    state.deploy.target = target;
+    syncState({ stage: 'deploy', current_phase: 'deploy' });
     let fixPrompt = null;
 
     while (true) {
       if (stopRequested()) stopNow();
+      await assertBudget('deploy');
       const attempt = state.deploy.retries + 1;
-      setActivity('deployer', `deploy: attempt ${attempt} — pushing to GitHub`, { current_phase: 'deploy' });
+      setActivity('deployer', `deploy: attempt ${attempt} — publishing to ${target}`);
       say('orchestrator', 'deployer', 'deploy', fixPrompt ? 'fix' : 'inject',
-        fixPrompt ? `Deployment still not live — fix it. (attempt ${attempt})` : `Project verified. Ship "${repoName}" to GitHub Pages.`);
+        fixPrompt ? `Still not live — fix it (attempt ${attempt}).` : `Project verified. Ship "${repoName}" to ${target}.`);
       logger.event('claude_start', { phase: 'deploy', agent: 'deployer', attempt });
 
       const dep = await runDeployer({
-        projectPath, config, onSpawn,
-        projectName, repoName, visibility: deployCfg.visibility, context, fixPrompt,
+        projectPath, config, onSpawn, projectName, repoName,
+        visibility: deployCfg.visibility, context, capabilities: capsText, target, fixPrompt,
       });
       trackCall(dep);
 
@@ -551,7 +958,7 @@ function main() {
         result: truncate(String(dep.parsed?.result ?? ''), 2000), deploy: info || null,
       });
       say('deployer', 'orchestrator', 'deploy', 'report',
-        info ? `Repo: ${info.repo_url || '?'} · URL: ${info.pages_url || '?'} · live: ${info.live}` : 'I did not write a deploy report.');
+        info ? `${info.target || target}: ${info.pages_url || '?'} (live: ${info.live})` : 'I did not write a deploy report.');
 
       let evidence = null;
       if (!dep.ok) {
@@ -563,8 +970,7 @@ function main() {
         state.deploy.pages_url = info.pages_url;
         syncState();
         if (deployCfg.verify_live) {
-          // Trust, but verify: poll the public URL ourselves.
-          setActivity('deployer', `deploy: waiting for ${info.pages_url} to come alive`);
+          setActivity('deployer', `deploy: verifying ${info.pages_url} really serves the site`);
           logger.event('live_check_start', { url: info.pages_url, timeout_ms: deployCfg.live_timeout_ms });
           const live = await waitUntilLive(info.pages_url, {
             timeoutMs: deployCfg.live_timeout_ms,
@@ -572,7 +978,7 @@ function main() {
             onAttempt: (r) => setActivity('deployer', `deploy: ${info.pages_url} -> ${r.detail}`),
           });
           if (live.aborted) stopNow();
-          logger.event('live_check_result', { url: info.pages_url, live: live.live, evidence: truncate(live.evidence, 3000) });
+          logger.event('live_check_result', { url: info.pages_url, live: live.live, evidence: truncate(live.evidence, 4000) });
           if (!live.live) evidence = `Independent live check failed.\n${live.evidence}`;
         } else if (info.live !== true) {
           evidence = 'Your deploy report says "live" is not true.';
@@ -581,26 +987,26 @@ function main() {
 
       if (!evidence) {
         state.deploy.status = 'live';
-        // Persisted in the queue so a rerun of this finished queue knows the
-        // site is already up and skips the deploy stage entirely.
         queue.deploy_state = { status: 'live', repo_url: state.deploy.repo_url, pages_url: state.deploy.pages_url };
         syncState();
         persist();
         logger.log(`DEPLOY VERIFIED LIVE: ${state.deploy.pages_url}`);
-        logger.event('deploy_done', { repo_url: state.deploy.repo_url, pages_url: state.deploy.pages_url });
-        say('orchestrator', 'orchestrator', 'deploy', 'passed', `Site verified live at ${state.deploy.pages_url}`);
-        return;
+        logger.event('deploy_done', { repo_url: state.deploy.repo_url, pages_url: state.deploy.pages_url, target });
+        say('orchestrator', 'orchestrator', 'deploy', 'passed', `Site verified live (assets included) at ${state.deploy.pages_url}`);
+        return { ok: true };
       }
 
-      logger.log(`Deploy attempt ${attempt} not live yet: ${truncate(evidence, 500)}`);
+      logger.log(`Deploy attempt ${attempt} not live: ${truncate(evidence, 500)}`);
       state.deploy.retries += 1;
-      if (state.deploy.retries > maxRetries) {
+      if (state.deploy.retries >= maxAttempts) {
         state.deploy.status = 'failed';
         syncState();
         logger.event('deploy_stuck', { retries: state.deploy.retries, evidence: truncate(evidence, 3000) });
-        finish('stuck', `Deploy stuck after ${state.deploy.retries} attempts: ${truncate(evidence, 300)}`, 2);
+        return { ok: false, evidence };
       }
-      fixPrompt = buildDeployFixPrompt({ deployInfo: info, evidence, projectName, repoName, visibility: deployCfg.visibility });
+      fixPrompt = buildDeployFixPrompt({
+        deployInfo: info, evidence, projectName, repoName, visibility: deployCfg.visibility, target,
+      });
       logger.event('fix_prompt', { phase: 'deploy', attempt: state.deploy.retries + 1, prompt: fixPrompt });
       syncState();
     }
